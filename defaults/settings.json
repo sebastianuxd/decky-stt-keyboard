@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "autoSubmit": false,
+  "language": "en-US",
+  "hotkey": "ctrl+shift+s",
+  "chordCommand": ["steam", "y"],
+  "theme": "dark",
+  "showInterimResults": true,
+  "continuousRecognition": true
+}

@@ -1,0 +1,12 @@
+{
+  "name": "STT Keyboard",
+  "author": "Your Name",
+  "flags": ["_root"],
+  "main": "index.js",
+  "main_py": "main.py",
+  "publish": {
+    "tags": ["utility", "keyboard", "accessibility"],
+    "description": "Adds speech-to-text functionality to Steam Deck's virtual keyboard for faster text input",
+    "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/decky-plugin-template"
+  }
+}

@@ -1,6 +1,6 @@
 {
   "name": "STT Keyboard",
-  "author": "Your Name",
+  "author": "Sebastian Helton",
   "flags": ["_root"],
   "main": "index.js",
   "main_py": "main.py",

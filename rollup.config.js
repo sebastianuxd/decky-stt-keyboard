@@ -32,6 +32,5 @@ export default {
     format: 'iife',
     exports: 'default',
     sourcemap: 'inline',
-    name: 'DeckySTTKeyboard'
   },
 };

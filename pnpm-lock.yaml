@@ -11,9 +11,6 @@ importers:
       decky-frontend-lib:
         specifier: ^3.25.0
         version: 3.25.0
-      pnpm:
-        specifier: ^10.24.0
-        version: 10.24.0
       react:
         specifier: 18.2.0
         version: 18.2.0
@@ -362,11 +359,6 @@ packages:
     resolution: {integrity: sha512-5gTmgEY/sqK6gFXLIsQNH19lWb4ebPDLA4SdLP7dsWkIXHWlG66oPuVvXSGFPppYZz8ZDZq0dYYrbHfBCVUb1Q==}
     engines: {node: '>=12'}
 
-  pnpm@10.24.0:
-    resolution: {integrity: sha512-Af+K5xtEGZA7ZcYPstydNM+LtuBtA73hEu8496NNaQTEJLpmvqXNzxKJAjC/OflYBHMUDtnJRv7zKLblI4o0Wg==}
-    engines: {node: '>=18.12'}
-    hasBin: true
-
   react-dom@18.2.0:
     resolution: {integrity: sha512-6IMTriUmvsjHUjNtEDudZfuDQUoWXVxKHhlEGSk81n4YFS+r/Kl99wXiwlVXtPBtJenozv2P+hxDsw9eA7Xo6g==}
     peerDependencies:
@@ -674,8 +666,6 @@ snapshots:
   path-parse@1.0.7: {}
 
   picomatch@4.0.3: {}
-
-  pnpm@10.24.0: {}
 
   react-dom@18.2.0(react@18.2.0):
     dependencies:

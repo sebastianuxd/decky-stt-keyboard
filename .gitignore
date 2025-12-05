@@ -34,4 +34,4 @@ pnpm-debug.log*
 *.tmp
 *.temp
 # Build artifacts
-decky-stt-keyboard.zip
+*.zip

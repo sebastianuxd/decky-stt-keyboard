@@ -37,18 +37,18 @@ jobs:
         run: pnpm run package
 
       - name: Verify Zip Creation
-        run: ls -la decky-stt-keyboard.zip
+        run: ls -la decky-stt-keyboard-*.zip
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: decky-stt-keyboard
-          path: decky-stt-keyboard.zip
+          path: decky-stt-keyboard-*.zip
 
       - name: Create Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: decky-stt-keyboard.zip
+          files: decky-stt-keyboard-*.zip
           generate_release_notes: true
           fail_on_unmatched_files: true

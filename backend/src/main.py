@@ -212,6 +212,9 @@ class Plugin:
 
     async def download_model(self):
         """Download the Vosk speech recognition model"""
+        logger.info("=" * 60)
+        logger.info("download_model() called")
+        logger.info("=" * 60)
         try:
             import urllib.request
             import zipfile
@@ -220,8 +223,11 @@ class Plugin:
             if not MODEL_DIR.exists():
                 try:
                     MODEL_DIR.mkdir(parents=True, exist_ok=True)
+                    logger.info(f"Created model directory: {MODEL_DIR}")
                 except Exception as e:
-                    return {"success": False, "error": f"Failed to create model directory: {e}"}
+                    error_msg = f"Failed to create model directory: {e}"
+                    logger.error(error_msg)
+                    return {"success": False, "error": error_msg}
 
             logger.info(f"Downloading model from {MODEL_URL}")
             

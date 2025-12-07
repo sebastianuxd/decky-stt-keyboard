@@ -1,3 +1,5 @@
+import { ServerAPI } from "decky-frontend-lib";
+
 export interface SpeechRecognitionResult {
   transcript: string;
   confidence: number;
@@ -9,137 +11,182 @@ export interface SpeechRecognitionError {
   message: string;
 }
 
-// Extend Window interface for Web Speech API
-declare global {
-  interface Window {
-    SpeechRecognition: any;
-    webkitSpeechRecognition: any;
-  }
+export interface ModelStatus {
+  downloaded: boolean;
+  path: string;
+  name: string;
 }
 
 export class SpeechToTextService {
-  private recognition: any;
+  private serverAPI: ServerAPI;
   private isListening: boolean = false;
   private onResultCallback?: (result: SpeechRecognitionResult) => void;
   private onErrorCallback?: (error: SpeechRecognitionError) => void;
   private onEndCallback?: () => void;
+  private onDownloadProgressCallback?: (progress: number) => void;
+  private listeners: { [key: string]: (data: any) => void } = {};
 
-  constructor() {
-    // Check if Speech Recognition API is available
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    
-    if (!SpeechRecognition) {
-      console.error("Speech Recognition API not available");
-      return;
-    }
-
-    this.recognition = new SpeechRecognition();
-    this.setupRecognition();
+  constructor(serverAPI: ServerAPI) {
+    this.serverAPI = serverAPI;
+    this.setupEventListeners();
   }
 
-  private setupRecognition() {
-    if (!this.recognition) return;
-
-    // Configure recognition
-    this.recognition.continuous = true;
-    this.recognition.interimResults = true;
-    this.recognition.maxAlternatives = 1;
-
-    // Handle results
-    this.recognition.onresult = (event: any) => {
-      const results = event.results;
-      const lastResult = results[results.length - 1];
-      const transcript = lastResult[0].transcript;
-      const confidence = lastResult[0].confidence;
-      const isFinal = lastResult.isFinal;
-
-      if (this.onResultCallback) {
+  private setupEventListeners() {
+    // Listen for STT events from backend
+    this.listeners["stt_partial"] = (data: any) => {
+      if (this.onResultCallback && data?.text) {
         this.onResultCallback({
-          transcript,
-          confidence,
-          isFinal,
+          transcript: data.text,
+          confidence: 0.5,
+          isFinal: false,
         });
       }
     };
 
-    // Handle errors
-    this.recognition.onerror = (event: any) => {
-      console.error("Speech recognition error:", event.error);
-      
+    this.listeners["stt_final"] = (data: any) => {
+      if (this.onResultCallback && data?.text) {
+        this.onResultCallback({
+          transcript: data.text,
+          confidence: 1.0,
+          isFinal: true,
+        });
+      }
+    };
+
+    this.listeners["stt_error"] = (data: any) => {
+      console.error("STT error from backend:", data?.error);
       if (this.onErrorCallback) {
         this.onErrorCallback({
-          error: event.error,
-          message: this.getErrorMessage(event.error),
+          error: "backend-error",
+          message: data?.error || "Unknown error occurred",
         });
       }
+      this.isListening = false;
     };
 
-    // Handle end
-    this.recognition.onend = () => {
+    this.listeners["stt_started"] = (data: any) => {
+      console.log("STT started:", data);
+      this.isListening = true;
+    };
+
+    this.listeners["stt_stopped"] = (data: any) => {
+      console.log("STT stopped:", data);
       this.isListening = false;
-      
       if (this.onEndCallback) {
         this.onEndCallback();
       }
     };
 
-    // Handle start
-    this.recognition.onstart = () => {
-      this.isListening = true;
-      console.log("Speech recognition started");
-    };
-  }
-
-  private getErrorMessage(error: string): string {
-    const errorMessages: { [key: string]: string } = {
-      "no-speech": "No speech detected. Please try again.",
-      "audio-capture": "No microphone found. Please ensure your microphone is connected.",
-      "not-allowed": "Microphone access denied. Please grant permission.",
-      "network": "Network error occurred. Please check your connection.",
-      "aborted": "Speech recognition was aborted.",
+    this.listeners["stt_download_progress"] = (data: any) => {
+      console.log("Model download progress:", data?.percent);
+      if (this.onDownloadProgressCallback) {
+        this.onDownloadProgressCallback(data?.percent || 0);
+      }
     };
 
-    return errorMessages[error] || "An unknown error occurred.";
-  }
+    this.listeners["stt_download_complete"] = (data: any) => {
+      console.log("Model download complete:", data);
+    };
 
-  public start(language: string = "en-US"): void {
-    if (!this.recognition) {
-      console.error("Speech Recognition not initialized");
-      return;
+    // Register all listeners
+    const deckyPlugin = (window as any).DeckyPlugin;
+    if (deckyPlugin) {
+      Object.entries(this.listeners).forEach(([event, handler]) => {
+        try {
+          deckyPlugin.addEventListener(event, handler);
+        } catch (e) {
+          console.error(`Failed to add listener for ${event}:`, e);
+        }
+      });
+    } else {
+      console.error("DeckyPlugin global not found, cannot register event listeners");
     }
+  }
 
+  public async start(language: string = "en-US"): Promise<void> {
     if (this.isListening) {
       console.warn("Speech recognition already running");
       return;
     }
 
-    this.recognition.lang = language;
-    
     try {
-      this.recognition.start();
+      const result = await this.serverAPI.callPluginMethod<{ language: string }, { success: boolean; error?: string }>(
+        "start_stt",
+        { language }
+      );
+
+      if (!result.success) {
+        throw new Error((result.result as any)?.error || "Failed to start STT");
+      }
     } catch (error) {
       console.error("Error starting speech recognition:", error);
+      if (this.onErrorCallback) {
+        this.onErrorCallback({
+          error: "start-failed",
+          message: error instanceof Error ? error.message : "Failed to start recording",
+        });
+      }
     }
   }
 
-  public stop(): void {
-    if (!this.recognition || !this.isListening) return;
+  public async stop(): Promise<void> {
+    if (!this.isListening) return;
 
     try {
-      this.recognition.stop();
+      await this.serverAPI.callPluginMethod("stop_stt", {});
     } catch (error) {
       console.error("Error stopping speech recognition:", error);
     }
   }
 
   public abort(): void {
-    if (!this.recognition) return;
+    // For backend-based STT, abort is the same as stop
+    this.stop();
+  }
 
+  public async getModelStatus(): Promise<ModelStatus | null> {
     try {
-      this.recognition.abort();
-      this.isListening = false;
+      const result = await this.serverAPI.callPluginMethod<{}, ModelStatus>("get_model_status", {});
+      return result.success ? result.result : null;
     } catch (error) {
-      console.error("Error aborting speech recognition:", error);
+      console.error("Error getting model status:", error);
+      return null;
+    }
+  }
+
+  public async downloadModel(): Promise<boolean> {
+    try {
+      console.log("SpeechToTextService: Calling download_model backend method...");
+      const result = await this.serverAPI.callPluginMethod<{}, { success: boolean; error?: string }>(
+        "download_model",
+        {}
+      );
+      console.log("SpeechToTextService: download_model result:", result);
+      
+      if (!result.success) {
+        console.error("SpeechToTextService: Backend call failed:", result);
+        return false;
+      }
+      
+      if (!result.result?.success) {
+        console.error("SpeechToTextService: Backend returned failure:", result.result?.error);
+        return false;
+      }
+      
+      return true;
+    } catch (error) {
+      console.error("Error downloading model:", error);
+      return false;
+    }
+  }
+
+  public async getMicrophoneStatus(): Promise<any> {
+    try {
+      const result = await this.serverAPI.callPluginMethod("get_microphone_status", {});
+      return result.success ? result.result : null;
+    } catch (error) {
+      console.error("Error getting microphone status:", error);
+      return null;
     }
   }
 
@@ -155,8 +202,13 @@ export class SpeechToTextService {
     this.onEndCallback = callback;
   }
 
+  public onDownloadProgress(callback: (progress: number) => void): void {
+    this.onDownloadProgressCallback = callback;
+  }
+
   public isSupported(): boolean {
-    return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+    // Backend-based STT is always supported
+    return true;
   }
 
   public getIsListening(): boolean {
@@ -164,12 +216,25 @@ export class SpeechToTextService {
   }
 
   public cleanup(): void {
-    if (this.recognition && this.isListening) {
-      this.abort();
+    if (this.isListening) {
+      this.stop();
     }
-    
+
+    // Remove all listeners
+    const deckyPlugin = (window as any).DeckyPlugin;
+    if (deckyPlugin) {
+      Object.entries(this.listeners).forEach(([event, handler]) => {
+        try {
+          deckyPlugin.removeEventListener(event, handler);
+        } catch (e) {
+          console.error(`Failed to remove listener for ${event}:`, e);
+        }
+      });
+    }
+
     this.onResultCallback = undefined;
     this.onErrorCallback = undefined;
     this.onEndCallback = undefined;
+    this.onDownloadProgressCallback = undefined;
   }
 }

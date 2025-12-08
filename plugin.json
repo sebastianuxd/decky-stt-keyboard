@@ -1,11 +1,18 @@
 {
   "name": "STT Keyboard",
   "author": "Sebastian Helton",
-  "flags": ["_root"],
+  "flags": [
+    "_root"
+  ],
   "main": "index.js",
   "main_py": "main.py",
+  "version": "1.0.22",
   "publish": {
-    "tags": ["utility", "keyboard", "accessibility"],
+    "tags": [
+      "utility",
+      "keyboard",
+      "accessibility"
+    ],
     "description": "Adds speech-to-text functionality to Steam Deck's virtual keyboard for faster text input",
     "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/decky-plugin-template"
   }

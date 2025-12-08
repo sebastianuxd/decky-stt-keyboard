@@ -1,12 +1,12 @@
 {
   "name": "decky-stt-keyboard",
-  "version": "1.0.4",
+  "version": "1.0.22",
   "description": "Speech-to-text virtual keyboard plugin for Steam Deck",
   "scripts": {
     "build": "shx rm -rf dist && rollup -c",
     "watch": "rollup -c -w",
-    "prepare_dist": "pnpm run build && shx rm -rf build && shx mkdir -p build/decky-stt-keyboard/dist && shx cp dist/index.js build/decky-stt-keyboard/dist/ && shx cp package.json plugin.json LICENSE README.md build/decky-stt-keyboard/ && shx cp backend/src/main.py build/decky-stt-keyboard/ && shx cp -r defaults build/decky-stt-keyboard/",
-    "package": "pnpm run prepare_dist && cd build && zip -r ../decky-stt-keyboard-v1.0.4.zip decky-stt-keyboard",
+    "prepare_dist": "pnpm run build && shx rm -rf build && shx mkdir -p build/decky-stt-keyboard/dist && shx cp dist/index.js build/decky-stt-keyboard/dist/ && shx cp package.json plugin.json LICENSE README.md build/decky-stt-keyboard/ && shx cp backend/src/main.py build/decky-stt-keyboard/ && shx cp backend/requirements.txt build/decky-stt-keyboard/ && shx cp -r defaults build/decky-stt-keyboard/ && shx cp -r backend/lib build/decky-stt-keyboard/",
+    "package": "pnpm run prepare_dist && cd build && zip -r ../decky-stt-keyboard-v1.0.22.zip decky-stt-keyboard",
     "deploy": "pnpm run prepare_dist && rsync -azp --delete --rsh=ssh --exclude='.git' --exclude='node_modules' build/decky-stt-keyboard/ deck@${DECK_IP}:homebrew/plugins/decky-stt-keyboard"
   },
   "keywords": [

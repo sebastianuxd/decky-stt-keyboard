@@ -5,16 +5,19 @@ import subprocess
 import asyncio
 import json
 import threading
+import time
+import zipfile
+import urllib.request
+import ssl
+from collections import deque
 from pathlib import Path
 
 # The decky plugin module is located at decky-loader/plugin
-# For the hosted code: `import decky` works, but the actual source is in decky-loader/plugin/decky.py
 import decky
 try:
     import decky_plugin
 except ImportError:
     decky_plugin = None
-import ssl
 
 # Create unverified SSL context for model download
 try:
@@ -31,384 +34,401 @@ logger = logging.getLogger()
 
 # Get the plugin directory
 PLUGIN_DIR = Path(decky.DECKY_PLUGIN_DIR)
-# Use a user-writable directory for data and dependencies
-# This avoids permission issues when the plugin directory is owned by root
 DATA_DIR = Path(os.environ.get("HOME", "/home/deck")) / ".local/share/decky-stt-keyboard"
-# We now bundle dependencies in the plugin directory itself to avoid installation issues
 BUNDLED_LIB_DIR = PLUGIN_DIR / "lib"
-MODEL_DIR = DATA_DIR / "models"
-REQUIREMENTS_FILE = PLUGIN_DIR / "requirements.txt"
-MODEL_NAME = "vosk-model-small-en-us-0.15"
-MODEL_PATH = MODEL_DIR / MODEL_NAME
-MODEL_URL = f"https://alphacephei.com/vosk/models/{MODEL_NAME}.zip"
 
+# Add bundled lib to Python path EARLY
+if BUNDLED_LIB_DIR.exists() and str(BUNDLED_LIB_DIR) not in sys.path:
+    sys.path.insert(0, str(BUNDLED_LIB_DIR))
+    logger.info(f"Added bundled lib to sys.path: {BUNDLED_LIB_DIR}")
+
+MODEL_DIR = DATA_DIR / "models"
+# Large model for best accuracy (~1.8GB download)
+MODEL_NAME = "vosk-model-en-us-0.22"
+MODEL_URL = f"https://alphacephei.com/vosk/models/{MODEL_NAME}.zip"
+MODEL_PATH = MODEL_DIR / MODEL_NAME
 
 class Plugin:
     """
-    STT Keyboard Backend Plugin
-    
-    Handles offline speech recognition using Vosk and sounddevice
-    for microphone access without browser permission issues.
+    STT Keyboard Backend Plugin (Vosk Edition)
     """
 
     def __init__(self):
         self.settings = {}
-        self.vosk_model = None
+        self.output_file = Path("/tmp/stt_output.txt")
+        self.model = None
         self.recognizer = None
         self.audio_stream = None
         self.is_recording = False
-        self.recording_thread = None
         self.loop = None
+        self.transcription_queue = deque(maxlen=100)
+        self.dump_fp = None  # Debug: dump audio to file handling
+
+    @staticmethod
+    def play_sound():
+        """Play the start listening sound"""
+        sound_paths = [
+            "/usr/share/sounds/freedesktop/stereo/bell.oga",
+            "/usr/share/sounds/freedesktop/stereo/message.oga",
+            "/usr/share/sounds/freedesktop/stereo/service-login.oga",
+        ]
+        
+        for sound_path in sound_paths:
+            if os.path.exists(sound_path):
+                try:
+                    subprocess.run(["paplay", sound_path], stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=2)
+                    return
+                except:
+                    continue
 
     def emit_event(self, event_name: str, data: dict):
         """Emit an event to the frontend"""
         try:
+            # Try to emit via decky directly first (synchronous-safe)
+            if hasattr(decky, 'emit'):
+                try:
+                    # decky.emit may be sync or async, handle both
+                    result = decky.emit(event_name, data)
+                    if asyncio.iscoroutine(result):
+                        if self.loop and self.loop.is_running():
+                            asyncio.run_coroutine_threadsafe(result, self.loop)
+                    return
+                except Exception as e:
+                    logger.debug(f"decky.emit failed, trying fallback: {e}")
+            
+            # Fallback to async emit via loop
             if self.loop and self.loop.is_running():
                 asyncio.run_coroutine_threadsafe(self._emit_async(event_name, data), self.loop)
-            else:
-                logger.warning(f"Event loop not ready, cannot emit {event_name}")
         except Exception as e:
             logger.error(f"Failed to emit event {event_name}: {e}")
 
     async def _emit_async(self, event_name: str, data: dict):
         try:
-            # Try to use self.emit (Decky Plugin API)
             if hasattr(self, "emit"):
                 await self.emit(event_name, data)
-            elif decky_plugin and hasattr(decky_plugin, "emit_event"):
-                decky_plugin.emit_event(event_name, data)
-            elif hasattr(decky, "emit_event"):
-                # Fallback to decky module
-                decky.emit_event(event_name, data)
-            else:
-                logger.error(f"No emit method available for event {event_name}")
+            elif decky_plugin and hasattr(decky_plugin, "emit"):
+                result = decky_plugin.emit(event_name, data)
+                if asyncio.iscoroutine(result):
+                    await result
+            elif hasattr(decky, "emit"):
+                result = decky.emit(event_name, data)
+                if asyncio.iscoroutine(result):
+                    await result
         except Exception as e:
-            logger.error(f"Error in _emit_async for {event_name}: {e}")
+            logger.error(f"Error in _emit_async: {e}")
 
     async def _main(self):
-        logger.info("=" * 60)
-        logger.info(f"STT KEYBOARD PLUGIN: _main() CALLED - STARTING INITIALIZATION. self type: {type(self)}")
-        
-        # Initialize attributes if running as class (static context)
-        if isinstance(self, type):
-            logger.info("Running in static context - initializing class attributes")
-            if not hasattr(self, "settings"): self.settings = {}
-            if not hasattr(self, "vosk_model"): self.vosk_model = None
-            if not hasattr(self, "recognizer"): self.recognizer = None
-            if not hasattr(self, "audio_stream"): self.audio_stream = None
-            if not hasattr(self, "is_recording"): self.is_recording = False
-            if not hasattr(self, "recording_thread"): self.recording_thread = None
-            if not hasattr(self, "loop"): self.loop = None
-
-        import os
-        import pwd
-        import inspect
-        try:
-            uid = os.getuid()
-            user = pwd.getpwuid(uid).pw_name
-            logger.info(f"Running as user: {user} (uid: {uid})")
-            logger.info(f"Plugin directory: {PLUGIN_DIR}")
-            if PLUGIN_DIR.exists():
-                stat = os.stat(PLUGIN_DIR)
-                logger.info(f"Plugin directory permissions: {oct(stat.st_mode)}")
-                logger.info(f"Plugin directory owner: {stat.st_uid}")
-            else:
-                logger.error(f"Plugin directory does not exist: {PLUGIN_DIR}")
-            
-            # Inspect _ensure_dependencies
-            logger.info(f"Inspecting _ensure_dependencies...")
-            try:
-                sig = inspect.signature(self._ensure_dependencies)
-                logger.info(f"_ensure_dependencies signature: {sig}")
-                is_static = isinstance(inspect.getattr_static(Plugin, '_ensure_dependencies'), staticmethod)
-                logger.info(f"_ensure_dependencies is staticmethod: {is_static}")
-            except Exception as e:
-                logger.error(f"Failed to inspect _ensure_dependencies: {e}")
-
-        except Exception as e:
-            logger.error(f"Failed to log environment info: {e}")
-        logger.info("=" * 60)
         try:
             self.loop = asyncio.get_running_loop()
-            if not hasattr(self, "settings"):
-                self.settings = {}
             
-            # Ensure data directory exists and is writable
-            try:
-                DATA_DIR.mkdir(parents=True, exist_ok=True)
-                if not os.access(DATA_DIR, os.W_OK):
-                    logger.error(f"CRITICAL: Data directory {DATA_DIR} is not writable!")
-            except Exception as e:
-                logger.error(f"Error creating data directory {DATA_DIR}: {e}")
+            # Initialize attributes if running as class
+            if isinstance(self, type):
+                if not hasattr(self, "settings"): self.settings = {}
+                if not hasattr(self, "model"): self.model = None
+                if not hasattr(self, "recognizer"): self.recognizer = None
+                if not hasattr(self, "audio_stream"): self.audio_stream = None
+                if not hasattr(self, "is_recording"): self.is_recording = False
+                if not hasattr(self, "transcription_queue"): self.transcription_queue = deque(maxlen=100)
 
-            # Ensure directories exist
-            try:
-                MODEL_DIR.mkdir(parents=True, exist_ok=True)
-            except PermissionError:
-                logger.error(f"Permission denied creating {MODEL_DIR}. Please check directory permissions.")
-            except Exception as e:
-                logger.error(f"Error creating {MODEL_DIR}: {e}")
-
-            # Check and install dependencies
-            if not await self._ensure_dependencies():
-                logger.error("Failed to ensure dependencies. Plugin functionality will be limited.")
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            MODEL_DIR.mkdir(parents=True, exist_ok=True)
             
-            logger.info("STT Keyboard: Settings initialized successfully")
+            if not await Plugin._ensure_dependencies():
+                logger.error("Failed to ensure dependencies")
+
             logger.info("STT Keyboard: Plugin loaded successfully")
         except Exception as e:
-            logger.error(f"STT Keyboard: Error during initialization: {e}", exc_info=True)
-            raise
+            logger.error(f"STT Keyboard initialization error: {e}", exc_info=True)
 
     async def _unload(self):
-        logger.info(f"STT Keyboard plugin unloading. self type: {type(self)}")
-        try:
-            if isinstance(self, type):
-                logger.info("Unloading in static context (self is class)")
-                # If self is the class, we need to pass it explicitly to the unbound method
-                await self.stop_stt(self)
-            else:
-                logger.info("Unloading in instance context")
-                await self.stop_stt()
-        except Exception as e:
-            logger.error(f"Error in _unload: {e}", exc_info=True)
+        if isinstance(self, type):
+            await Plugin.stop_stt(self)
+        else:
+            await self.stop_stt()
         logger.info("STT Keyboard plugin unloaded")
 
     @staticmethod
     async def _ensure_dependencies():
-        """Ensure Python dependencies are available"""
         try:
-            # Add bundled lib directory to Python path
-            if BUNDLED_LIB_DIR.exists():
-                if str(BUNDLED_LIB_DIR) not in sys.path:
-                    sys.path.insert(0, str(BUNDLED_LIB_DIR))
-                    logger.info(f"Added bundled lib directory to sys.path: {BUNDLED_LIB_DIR}")
-            else:
-                logger.error(f"Bundled lib directory not found: {BUNDLED_LIB_DIR}")
-                return False
-
-            # Check if dependencies are importable
-            try:
-                import vosk
-                import sounddevice
-                import numpy
-                logger.info("All dependencies successfully imported")
-                return True
-            except ImportError as e:
-                logger.error(f"Failed to import dependencies despite adding lib to path: {e}")
-                return False
-            
-        except Exception as e:
-            logger.error(f"Error ensuring dependencies: {e}", exc_info=True)
+            import sounddevice
+            import numpy
+            import vosk
+            logger.info("Dependencies imported: sounddevice, numpy, vosk")
+            return True
+        except ImportError as e:
+            logger.error(f"Failed to import dependencies: {e}")
             return False
 
     async def get_model_status(self):
-        """Check if the Vosk model is downloaded"""
-        model_exists = MODEL_PATH.exists() and (MODEL_PATH / "am").exists()
+        downloaded = MODEL_PATH.exists()
         return {
-            "downloaded": model_exists,
-            "path": str(MODEL_PATH),
+            "downloaded": downloaded,
+            "path": str(MODEL_PATH) if downloaded else "",
             "name": MODEL_NAME
         }
 
     async def download_model(self):
-        """Download the Vosk speech recognition model"""
+        logger.info(f"Downloading model from {MODEL_URL}")
         try:
-            import urllib.request
-            import zipfile
-            
-            # Ensure model directory exists
             if not MODEL_DIR.exists():
-                try:
-                    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-                except Exception as e:
-                    return {"success": False, "error": f"Failed to create model directory: {e}"}
+                MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-            logger.info(f"Downloading model from {MODEL_URL}")
-            
             zip_path = MODEL_DIR / f"{MODEL_NAME}.zip"
             
-            # Download with progress - capture self in closure explicitly
-            plugin_instance = self
-            def download_progress(block_num, block_size, total_size):
-                downloaded = block_num * block_size
-                percent = min(100, (downloaded / total_size) * 100)
-                plugin_instance.emit_event("stt_download_progress", {"percent": percent})
+            # Download with progress
+            plugin_self = self
+            def progress_hook(count, block_size, total_size):
+                percent = int(count * block_size * 100 / total_size)
+                if count % 100 == 0:
+                    if isinstance(plugin_self, type):
+                        Plugin.emit_event(plugin_self, "download_progress", {"percent": percent})
+                    else:
+                        plugin_self.emit_event("download_progress", {"percent": percent})
             
-            urllib.request.urlretrieve(MODEL_URL, zip_path, download_progress)
+            opener = urllib.request.build_opener()
+            opener.addheaders = [('User-agent', 'Mozilla/5.0')]
+            urllib.request.install_opener(opener)
             
-            logger.info("Extracting model...")
-            self.emit_event("stt_download_progress", {"percent": 100, "status": "extracting"})
+            urllib.request.urlretrieve(MODEL_URL, zip_path, reporthook=progress_hook)
+            logger.info("Download complete. Extracting...")
+            if isinstance(plugin_self, type):
+                Plugin.emit_event(plugin_self, "download_progress", {"percent": 100, "status": "Extracting..."})
+            else:
+                plugin_self.emit_event("download_progress", {"percent": 100, "status": "Extracting..."})
             
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(MODEL_DIR)
             
-            # Clean up zip file
-            zip_path.unlink()
+            if zip_path.exists():
+                os.remove(zip_path)
+                
+            logger.info("Model extracted successfully")
             
-            logger.info("Model downloaded and extracted successfully")
-            self.emit_event("stt_download_complete", {"success": True})
-            return {"success": True, "path": str(MODEL_PATH)}
+            # Auto-load model
+            if isinstance(plugin_self, type):
+                await Plugin.load_model(plugin_self)
+            else:
+                await plugin_self.load_model()
             
+            return {"success": True}
         except Exception as e:
-            logger.error(f"Error downloading model: {e}", exc_info=True)
-            self.emit_event("stt_download_complete", {"success": False, "error": str(e)})
+            logger.error(f"Download failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     async def load_model(self):
-        """Load the Vosk model into memory"""
         try:
-            if self.vosk_model is not None:
-                logger.info("Model already loaded")
+            if self.model is not None:
                 return {"success": True}
-            
-            # Check if model exists
-            status = await self.get_model_status()
-            if not status["downloaded"]:
+                
+            if not MODEL_PATH.exists():
                 return {"success": False, "error": "Model not downloaded"}
-            
+
             import vosk
-            
-            logger.info(f"Loading model from {MODEL_PATH}")
-            self.vosk_model = vosk.Model(str(MODEL_PATH))
-            
-            logger.info("Model loaded successfully")
+            vosk.SetLogLevel(-1) # Silence generic logs
+            logger.info(f"Loading Vosk model from {MODEL_PATH}")
+            self.model = vosk.Model(str(MODEL_PATH))
+            logger.info("Vosk model loaded")
             return {"success": True}
-            
         except Exception as e:
-            logger.error(f"Error loading model: {e}", exc_info=True)
+            logger.error(f"Load model failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     def _audio_callback(self, indata, frames, time_info, status):
-        """Callback for audio stream - processes audio data"""
         try:
             if status:
-                logger.warning(f"Audio callback status: {status}")
+                logger.warning(f"Audio status: {status}")
             
-            if self.recognizer is None:
-                return
+            import numpy as np
             
-            # Convert audio data to bytes
-            audio_data = bytes(indata)
+            # Convert to numpy array (float for processing)
+            audio_array = np.frombuffer(indata, dtype=np.int16).copy().astype(np.float32)
             
-            # Process with Vosk
-            if self.recognizer.AcceptWaveform(audio_data):
-                # Final result
-                result = json.loads(self.recognizer.Result())
-                if result.get("text"):
-                    self.emit_event("stt_final", {"text": result["text"]})
+            # Debug: Log periodically to confirm callback is working
+            if not hasattr(self, '_callback_count'):
+                self._callback_count = 0
+            self._callback_count += 1
+            if self._callback_count % 50 == 1:  # Log every 50 callbacks
+                logger.info(f"Audio callback #{self._callback_count}: buffer size={len(audio_array)}, rms={np.sqrt(np.mean(audio_array ** 2)):.1f}")
+            
+            # ===== MINIMAL PROCESSING =====
+            # NOTE: Noise reduction disabled - VOSK handles noise well on its own
+            # Complex filtering was hurting accuracy more than helping
+            
+            # Just apply clip protection to prevent distortion
+            audio_array = np.clip(audio_array, -32767, 32767)
+            
+            # Convert back to int16 for VOSK
+            audio_int16 = audio_array.astype(np.int16)
+
+            # Pass to recognizer
+            if self.recognizer and self.recognizer.AcceptWaveform(audio_int16.tobytes()):
+                res = json.loads(self.recognizer.Result())
+                text = res.get("text", "")
+                if text:
+                    logger.info(f"Final result: {text}")
+                    # Store in queue for polling
+                    self.transcription_queue.append({"result": text, "final": True})
+                    if isinstance(self, type):
+                        Plugin.emit_event(self, "stt_result", {"result": text, "final": True})
+                    else:
+                        self.emit_event("stt_result", {"result": text, "final": True})
             else:
-                # Partial result
-                partial = json.loads(self.recognizer.PartialResult())
-                if partial.get("partial"):
-                    self.emit_event("stt_partial", {"text": partial["partial"]})
-                    
+                if self.recognizer:
+                    partial = json.loads(self.recognizer.PartialResult())
+                    text = partial.get("partial", "")
+                    if text:
+                        logger.info(f"Partial result: {text}")
+                        # Store in queue for polling (only newest partial to avoid spam)
+                        # Remove old partials first
+                        while self.transcription_queue and not self.transcription_queue[-1].get("final"):
+                            self.transcription_queue.pop()
+                        self.transcription_queue.append({"result": text, "final": False})
+                        if isinstance(self, type):
+                            Plugin.emit_event(self, "stt_result", {"result": text, "final": False})
+                        else:
+                            self.emit_event("stt_result", {"result": text, "final": False})
+
         except Exception as e:
-            logger.error(f"Error in audio callback: {e}", exc_info=True)
+            logger.error(f"Callback error: {e}", exc_info=True)
 
     async def start_stt(self, language: str = "en-US"):
-        """Start speech-to-text recording"""
+        if self.is_recording: return {"success": False, "error": "Already recording"}
+        
+        # Load model if needed
+        if self.model is None:
+            if isinstance(self, type):
+                await Plugin.load_model(self)
+            else:
+                await self.load_model()
+            if self.model is None:
+                return {"success": False, "error": "Model failed to load"}
+
         try:
-            if self.is_recording:
-                logger.warning("STT already recording")
-                return {"success": False, "error": "Already recording"}
-            
-            # Ensure model is loaded
-            if self.vosk_model is None:
-                load_result = await self.load_model()
-                if not load_result["success"]:
-                    return load_result
-            
-            import vosk
             import sounddevice as sd
+            import vosk
+            import numpy as np
             
-            # Create recognizer
-            self.recognizer = vosk.KaldiRecognizer(self.vosk_model, 16000)
+            self.recognizer = vosk.KaldiRecognizer(self.model, 16000)
+            self.play_sound()
             
-            # Start audio stream
-            logger.info("Starting audio recording...")
+            # Get device's default sample rate
+            device_info = sd.query_devices(kind='input')
+            device_samplerate = int(device_info['default_samplerate'])
+            logger.info(f"Using device sample rate: {device_samplerate}")
+            
+            # Calculate resampling parameters
+            target_samplerate = 16000
+            resample_ratio = device_samplerate / target_samplerate
+            
+            # Define callback wrapper with linear interpolation resampling
+            plugin_self = self
+            def callback_wrapper(indata, frames, time_info, status):
+                try:
+                    # Resample from device rate to 16kHz using linear interpolation
+                    audio_data = np.frombuffer(indata, dtype=np.int16).astype(np.float32)
+                    
+                    if resample_ratio != 1.0:
+                        # Linear interpolation resampling (much better quality than decimation)
+                        old_length = len(audio_data)
+                        new_length = int(old_length / resample_ratio)
+                        old_indices = np.arange(old_length)
+                        new_indices = np.linspace(0, old_length - 1, new_length)
+                        resampled = np.interp(new_indices, old_indices, audio_data).astype(np.int16)
+                    else:
+                        resampled = audio_data.astype(np.int16)
+                    
+                    # Call the audio callback with resampled data
+                    if isinstance(plugin_self, type):
+                        Plugin._audio_callback(plugin_self, resampled.tobytes(), len(resampled), time_info, status)
+                    else:
+                        plugin_self._audio_callback(resampled.tobytes(), len(resampled), time_info, status)
+                except Exception as e:
+                    logger.error(f"Callback wrapper error: {e}")
+
+            logger.info("Starting stream...")
+            # Use smaller blocksize for faster response (2000 samples @ 16kHz = 125ms)
+            blocksize = int(2000 * resample_ratio)
             self.audio_stream = sd.RawInputStream(
-                samplerate=16000,
-                blocksize=8000,
-                dtype='int16',
-                channels=1,
-                callback=self._audio_callback
+                samplerate=device_samplerate, 
+                blocksize=blocksize, 
+                dtype='int16', 
+                channels=1, 
+                callback=callback_wrapper
             )
-            
             self.audio_stream.start()
             self.is_recording = True
-            
-            self.emit_event("stt_started", {"success": True})
-            logger.info("STT recording started")
-            
             return {"success": True}
-            
         except Exception as e:
-            logger.error(f"Error starting STT: {e}", exc_info=True)
-            self.emit_event("stt_error", {"error": str(e)})
+            logger.error(f"Start failed: {e}", exc_info=True)
             return {"success": False, "error": str(e)}
 
     async def stop_stt(self):
-        """Stop speech-to-text recording"""
-        logger.info(f"stop_stt called. self type: {type(self)}")
+        if not self.is_recording: return {"success": True}
+        
         try:
-            # Handle static context where self might be the class but attributes are on the class
-            if isinstance(self, type):
-                is_recording = getattr(self, "is_recording", False)
-            else:
-                is_recording = self.is_recording
-
-            if not is_recording:
-                logger.info("stop_stt: Not recording, nothing to stop")
-                return {"success": True}
-            
-            logger.info("Stopping STT recording...")
-            
             if self.audio_stream:
                 self.audio_stream.stop()
                 self.audio_stream.close()
                 self.audio_stream = None
             
-            self.recognizer = None
             self.is_recording = False
             
-            self.emit_event("stt_stopped", {"success": True})
-            logger.info("STT recording stopped")
+            # Get final result
+            if self.recognizer:
+                res = json.loads(self.recognizer.FinalResult())
+                text = res.get("text", "")
+                if text:
+                    if isinstance(self, type):
+                        Plugin.emit_event(self, "stt_result", {"result": text, "final": True})
+                    else:
+                        self.emit_event("stt_result", {"result": text, "final": True})
             
             return {"success": True}
-            
         except Exception as e:
-            logger.error(f"Error stopping STT: {e}", exc_info=True)
+            logger.error(f"Stop failed: {e}")
             return {"success": False, "error": str(e)}
 
-    async def get_setting(self, key: str, default=None):
-        """Get a setting value"""
-        logger.info(f"Getting setting: {key}")
-        return self.settings.get(key, default)
-
-    async def set_setting(self, key: str, value):
-        """Set a setting value"""
-        logger.info(f"Setting {key} to {value}")
-        self.settings[key] = value
-        return True
-
     async def get_microphone_status(self):
-        """Check if microphone is available"""
         try:
             import sounddevice as sd
-            devices = sd.query_devices()
-            default_input = sd.query_devices(kind='input')
-            
-            return {
-                "available": True,
-                "default_device": default_input['name'] if default_input else None,
-                "is_recording": self.is_recording
-            }
-        except Exception as e:
-            logger.error(f"Error checking microphone: {e}")
-            return {"available": False, "error": str(e)}
+            d = sd.query_devices(kind='input')
+            return {"available": True, "device": d['name'] if d else "Default", "is_recording": self.is_recording}
+        except:
+            return {"available": False}
 
-    # Asyncio-compatible long-running code, executed in a task when the plugin is loaded
-    async def _migration(self):
-        logger.info("STT Keyboard plugin migration check")
-        # Perform any necessary migrations here
-        pass
+    async def get_pending_results(self):
+        """Get pending transcription results for polling - clears queue after read"""
+        results = list(self.transcription_queue)
+        self.transcription_queue.clear()
+        return {"results": results, "is_recording": self.is_recording}
+
+    async def copy_to_clipboard(self, text: str):
+        # Implementation from previous fixes (xclip/xsel/wl-copy/qdbus)
+        try:
+            # Try qdbus (KDE/SteamDeck standard)
+            try:
+                p = subprocess.run(["qdbus", "org.kde.klipper", "/klipper", "setClipboardContents", text], 
+                                stderr=subprocess.PIPE, timeout=2)
+                if p.returncode == 0: return {"success": True}
+            except: pass
+
+            # Try wl-copy
+            try:
+                p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                p.communicate(input=text.encode('utf-8'), timeout=2)
+                if p.returncode == 0: return {"success": True}
+            except: pass
+            
+            # Try xclip
+            try:
+                p = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+                p.communicate(input=text.encode('utf-8'), timeout=2)
+                if p.returncode == 0: return {"success": True}
+            except: pass
+
+            return {"success": False, "error": "No clipboard tool worked"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    async def get_transcriptions(self):
+        return {"success": True, "results": []} # Vosk pushes events, no polling needed really, but kept for API compat

@@ -84,11 +84,21 @@ class Plugin:
     def emit_event(self, event_name: str, data: dict):
         """Emit an event to the frontend"""
         try:
+            # Try to emit via decky directly first (synchronous-safe)
+            if hasattr(decky, 'emit'):
+                try:
+                    # decky.emit may be sync or async, handle both
+                    result = decky.emit(event_name, data)
+                    if asyncio.iscoroutine(result):
+                        if self.loop and self.loop.is_running():
+                            asyncio.run_coroutine_threadsafe(result, self.loop)
+                    return
+                except Exception as e:
+                    logger.debug(f"decky.emit failed, trying fallback: {e}")
+            
+            # Fallback to async emit via loop
             if self.loop and self.loop.is_running():
-                if isinstance(self, type):
-                   asyncio.run_coroutine_threadsafe(Plugin._emit_async(self, event_name, data), self.loop)
-                else:
-                   asyncio.run_coroutine_threadsafe(self._emit_async(event_name, data), self.loop)
+                asyncio.run_coroutine_threadsafe(self._emit_async(event_name, data), self.loop)
         except Exception as e:
             logger.error(f"Failed to emit event {event_name}: {e}")
 
@@ -97,9 +107,13 @@ class Plugin:
             if hasattr(self, "emit"):
                 await self.emit(event_name, data)
             elif decky_plugin and hasattr(decky_plugin, "emit"):
-                decky_plugin.emit(event_name, data)
+                result = decky_plugin.emit(event_name, data)
+                if asyncio.iscoroutine(result):
+                    await result
             elif hasattr(decky, "emit"):
-                decky.emit(event_name, data)
+                result = decky.emit(event_name, data)
+                if asyncio.iscoroutine(result):
+                    await result
         except Exception as e:
             logger.error(f"Error in _emit_async: {e}")
 
@@ -159,10 +173,14 @@ class Plugin:
             zip_path = MODEL_DIR / f"{MODEL_NAME}.zip"
             
             # Download with progress
+            plugin_self = self
             def progress_hook(count, block_size, total_size):
                 percent = int(count * block_size * 100 / total_size)
                 if count % 100 == 0:
-                    self.emit_event("download_progress", {"percent": percent})
+                    if isinstance(plugin_self, type):
+                        Plugin.emit_event(plugin_self, "download_progress", {"percent": percent})
+                    else:
+                        plugin_self.emit_event("download_progress", {"percent": percent})
             
             opener = urllib.request.build_opener()
             opener.addheaders = [('User-agent', 'Mozilla/5.0')]
@@ -170,7 +188,10 @@ class Plugin:
             
             urllib.request.urlretrieve(MODEL_URL, zip_path, reporthook=progress_hook)
             logger.info("Download complete. Extracting...")
-            self.emit_event("download_progress", {"percent": 100, "status": "Extracting..."})
+            if isinstance(plugin_self, type):
+                Plugin.emit_event(plugin_self, "download_progress", {"percent": 100, "status": "Extracting..."})
+            else:
+                plugin_self.emit_event("download_progress", {"percent": 100, "status": "Extracting..."})
             
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(MODEL_DIR)
@@ -213,21 +234,56 @@ class Plugin:
             
             import numpy as np
             
-            # Convert to numpy array (int16)
-            audio_array = np.frombuffer(indata, dtype=np.int16).copy()
+            # Convert to numpy array (float for processing)
+            audio_array = np.frombuffer(indata, dtype=np.int16).copy().astype(np.float32)
             
-            # GAIN NORMALIZATION
+            # ===== NOISE REDUCTION PIPELINE =====
+            
+            # 1. NOISE GATE - Silence audio below threshold (removes background noise)
+            noise_threshold = 150  # Adjust based on mic sensitivity (int16 range: 0-32767)
+            rms = np.sqrt(np.mean(audio_array ** 2))
+            if rms < noise_threshold:
+                # Very quiet - likely just noise, zero it out
+                audio_array = np.zeros_like(audio_array)
+            
+            # 2. HIGH-PASS FILTER - Remove low frequency rumble (< ~100Hz)
+            # Simple first-order high-pass filter using difference
+            if len(audio_array) > 1:
+                # Alpha controls cutoff: higher = more bass removed
+                # For 16kHz sample rate, alpha ~0.97 gives ~80Hz cutoff
+                alpha = 0.97
+                filtered = np.zeros_like(audio_array)
+                filtered[0] = audio_array[0]
+                for i in range(1, len(audio_array)):
+                    filtered[i] = alpha * (filtered[i-1] + audio_array[i] - audio_array[i-1])
+                audio_array = filtered
+            
+            # 3. SOFT NOISE GATE - Reduce (don't eliminate) quiet sections
+            # This preserves speech tails while reducing constant background
+            soft_threshold = 300
+            if rms > noise_threshold and rms < soft_threshold:
+                # Reduce volume of borderline audio
+                reduction = rms / soft_threshold  # 0.5 to 1.0
+                audio_array = audio_array * reduction
+            
+            # 4. GAIN NORMALIZATION - Boost quiet speech
             max_val = np.max(np.abs(audio_array))
             if max_val > 0:
-                # Target roughly 50-80% of max range (32767)
+                # Target roughly 60% of max range (32767)
                 target = 20000 
                 if max_val < target:
-                    gain = min(target / max_val, 15.0) # Max 15x boost
+                    gain = min(target / max_val, 10.0)  # Max 10x boost
                     if gain > 1.2:
-                        audio_array = (audio_array * gain).astype(np.int16)
+                        audio_array = audio_array * gain
+            
+            # 5. CLIP PROTECTION - Prevent distortion
+            audio_array = np.clip(audio_array, -32767, 32767)
+            
+            # Convert back to int16 for VOSK
+            audio_int16 = audio_array.astype(np.int16)
 
             # Pass to recognizer
-            if self.recognizer and self.recognizer.AcceptWaveform(audio_array.tobytes()):
+            if self.recognizer and self.recognizer.AcceptWaveform(audio_int16.tobytes()):
                 res = json.loads(self.recognizer.Result())
                 text = res.get("text", "")
                 if text:

@@ -192,10 +192,10 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
         <PanelSectionRow>
           <ButtonItem
             layout="below"
-            label={isDownloading ? `Downloading... ${downloadProgress.toFixed(0)}%` : "Download Speech Model"}
+            label={isDownloading ? "Downloading, please wait..." : "Download Speech Model"}
             onClick={handleDownloadModel}
             disabled={isDownloading}
-            description="Download the offline model (~40MB) to enable speech recognition."
+            description="Download the offline model (~1.8GB). May take up to 10 minutes. Do not close Quick Access Menu until complete."
           />
         </PanelSectionRow>
       )}
@@ -278,6 +278,15 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
           {isListening ? "🔴 Recording in progress..." : "🎤 Ready to record"}
         </div>
       </PanelSectionRow>
+
+      {/* User tips */}
+      {modelStatus?.downloaded && (
+        <PanelSectionRow>
+          <div style={tipsStyle}>
+            💡 Keep Steam Deck within 12" of your face and speak clearly. An external microphone may provide more accuracy.
+          </div>
+        </PanelSectionRow>
+      )}
     </PanelSection>
   );
 };
@@ -312,6 +321,15 @@ const hintStyle: React.CSSProperties = {
   fontSize: "0.85em",
   color: "#888",
   width: "100%",
+};
+
+const tipsStyle: React.CSSProperties = {
+  textAlign: "center",
+  fontSize: "0.8em",
+  color: "#666",
+  fontStyle: "italic",
+  width: "100%",
+  padding: "8px 0",
 };
 
 export default definePlugin((serverApi: ServerAPI) => {

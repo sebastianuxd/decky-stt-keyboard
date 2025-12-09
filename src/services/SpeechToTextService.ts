@@ -26,7 +26,7 @@ export class SpeechToTextService {
   private onDownloadProgressCallback?: (progress: number) => void;
   private listeners: { [key: string]: (data: any) => void } = {};
   private pollInterval: number | null = null;
-  private readonly POLL_INTERVAL_MS = 200; // Poll every 200ms
+  private readonly POLL_INTERVAL_MS = 100; // Poll every 100ms for better responsiveness
 
   constructor(serverAPI: ServerAPI) {
     this.serverAPI = serverAPI;
@@ -124,6 +124,9 @@ export class SpeechToTextService {
       }
 
       this.isListening = true;
+
+      // Start polling for results since events may not be reliable
+      this.startPolling();
     } catch (error) {
       console.error("[SpeechToTextService] Error starting speech recognition:", error);
       if (this.onErrorCallback) {
@@ -135,10 +138,52 @@ export class SpeechToTextService {
     }
   }
 
+  private startPolling(): void {
+    if (this.pollInterval) return;
+
+    console.log("[SpeechToTextService] Starting polling for results...");
+    this.pollInterval = window.setInterval(async () => {
+      try {
+        const response = await this.serverAPI.callPluginMethod<{}, { results: Array<{ result: string; final: boolean }>; is_recording: boolean }>(
+          "get_pending_results",
+          {}
+        );
+
+        if (response.success && response.result?.results) {
+          for (const item of response.result.results) {
+            if (this.onResultCallback && item.result) {
+              this.onResultCallback({
+                transcript: item.result,
+                confidence: item.final ? 1.0 : 0.5,
+                isFinal: item.final,
+              });
+            }
+          }
+        }
+
+        // Stop polling if no longer recording
+        if (response.success && !response.result?.is_recording && !this.isListening) {
+          this.stopPolling();
+        }
+      } catch (e) {
+        console.error("[SpeechToTextService] Polling error:", e);
+      }
+    }, this.POLL_INTERVAL_MS);
+  }
+
+  private stopPolling(): void {
+    if (this.pollInterval) {
+      console.log("[SpeechToTextService] Stopping polling");
+      window.clearInterval(this.pollInterval);
+      this.pollInterval = null;
+    }
+  }
+
   public async stop(): Promise<void> {
     if (!this.isListening) return;
 
     this.isListening = false;
+    this.stopPolling();
 
     try {
       await this.serverAPI.callPluginMethod("stop_stt", {});
@@ -150,8 +195,6 @@ export class SpeechToTextService {
       this.onEndCallback();
     }
   }
-
-  // Polling methods removed as Vosk pushes events directly
 
   public abort(): void {
     // For backend-based STT, abort is the same as stop

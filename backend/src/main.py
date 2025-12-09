@@ -43,8 +43,8 @@ if BUNDLED_LIB_DIR.exists() and str(BUNDLED_LIB_DIR) not in sys.path:
     logger.info(f"Added bundled lib to sys.path: {BUNDLED_LIB_DIR}")
 
 MODEL_DIR = DATA_DIR / "models"
-# Using a better quality but still lightweight model
-MODEL_NAME = "vosk-model-en-us-0.22-lgraph"
+# Large model for best accuracy (~1.8GB download)
+MODEL_NAME = "vosk-model-en-us-0.22"
 MODEL_URL = f"https://alphacephei.com/vosk/models/{MODEL_NAME}.zip"
 MODEL_PATH = MODEL_DIR / MODEL_NAME
 
@@ -133,7 +133,7 @@ class Plugin:
             DATA_DIR.mkdir(parents=True, exist_ok=True)
             MODEL_DIR.mkdir(parents=True, exist_ok=True)
             
-            if not await self._ensure_dependencies():
+            if not await Plugin._ensure_dependencies():
                 logger.error("Failed to ensure dependencies")
 
             logger.info("STT Keyboard: Plugin loaded successfully")
@@ -141,7 +141,10 @@ class Plugin:
             logger.error(f"STT Keyboard initialization error: {e}", exc_info=True)
 
     async def _unload(self):
-        await self.stop_stt()
+        if isinstance(self, type):
+            await Plugin.stop_stt(self)
+        else:
+            await self.stop_stt()
         logger.info("STT Keyboard plugin unloaded")
 
     @staticmethod
@@ -202,7 +205,10 @@ class Plugin:
             logger.info("Model extracted successfully")
             
             # Auto-load model
-            await self.load_model()
+            if isinstance(plugin_self, type):
+                await Plugin.load_model(plugin_self)
+            else:
+                await plugin_self.load_model()
             
             return {"success": True}
         except Exception as e:
@@ -237,46 +243,18 @@ class Plugin:
             # Convert to numpy array (float for processing)
             audio_array = np.frombuffer(indata, dtype=np.int16).copy().astype(np.float32)
             
-            # ===== NOISE REDUCTION PIPELINE =====
+            # Debug: Log periodically to confirm callback is working
+            if not hasattr(self, '_callback_count'):
+                self._callback_count = 0
+            self._callback_count += 1
+            if self._callback_count % 50 == 1:  # Log every 50 callbacks
+                logger.info(f"Audio callback #{self._callback_count}: buffer size={len(audio_array)}, rms={np.sqrt(np.mean(audio_array ** 2)):.1f}")
             
-            # 1. NOISE GATE - Silence audio below threshold (removes background noise)
-            noise_threshold = 150  # Adjust based on mic sensitivity (int16 range: 0-32767)
-            rms = np.sqrt(np.mean(audio_array ** 2))
-            if rms < noise_threshold:
-                # Very quiet - likely just noise, zero it out
-                audio_array = np.zeros_like(audio_array)
+            # ===== MINIMAL PROCESSING =====
+            # NOTE: Noise reduction disabled - VOSK handles noise well on its own
+            # Complex filtering was hurting accuracy more than helping
             
-            # 2. HIGH-PASS FILTER - Remove low frequency rumble (< ~100Hz)
-            # Simple first-order high-pass filter using difference
-            if len(audio_array) > 1:
-                # Alpha controls cutoff: higher = more bass removed
-                # For 16kHz sample rate, alpha ~0.97 gives ~80Hz cutoff
-                alpha = 0.97
-                filtered = np.zeros_like(audio_array)
-                filtered[0] = audio_array[0]
-                for i in range(1, len(audio_array)):
-                    filtered[i] = alpha * (filtered[i-1] + audio_array[i] - audio_array[i-1])
-                audio_array = filtered
-            
-            # 3. SOFT NOISE GATE - Reduce (don't eliminate) quiet sections
-            # This preserves speech tails while reducing constant background
-            soft_threshold = 300
-            if rms > noise_threshold and rms < soft_threshold:
-                # Reduce volume of borderline audio
-                reduction = rms / soft_threshold  # 0.5 to 1.0
-                audio_array = audio_array * reduction
-            
-            # 4. GAIN NORMALIZATION - Boost quiet speech
-            max_val = np.max(np.abs(audio_array))
-            if max_val > 0:
-                # Target roughly 60% of max range (32767)
-                target = 20000 
-                if max_val < target:
-                    gain = min(target / max_val, 10.0)  # Max 10x boost
-                    if gain > 1.2:
-                        audio_array = audio_array * gain
-            
-            # 5. CLIP PROTECTION - Prevent distortion
+            # Just apply clip protection to prevent distortion
             audio_array = np.clip(audio_array, -32767, 32767)
             
             # Convert back to int16 for VOSK
@@ -287,45 +265,92 @@ class Plugin:
                 res = json.loads(self.recognizer.Result())
                 text = res.get("text", "")
                 if text:
-                    self.emit_event("stt_result", {"result": text, "final": True})
+                    logger.info(f"Final result: {text}")
+                    # Store in queue for polling
+                    self.transcription_queue.append({"result": text, "final": True})
+                    if isinstance(self, type):
+                        Plugin.emit_event(self, "stt_result", {"result": text, "final": True})
+                    else:
+                        self.emit_event("stt_result", {"result": text, "final": True})
             else:
                 if self.recognizer:
                     partial = json.loads(self.recognizer.PartialResult())
                     text = partial.get("partial", "")
                     if text:
-                         self.emit_event("stt_result", {"result": text, "final": False})
+                        logger.info(f"Partial result: {text}")
+                        # Store in queue for polling (only newest partial to avoid spam)
+                        # Remove old partials first
+                        while self.transcription_queue and not self.transcription_queue[-1].get("final"):
+                            self.transcription_queue.pop()
+                        self.transcription_queue.append({"result": text, "final": False})
+                        if isinstance(self, type):
+                            Plugin.emit_event(self, "stt_result", {"result": text, "final": False})
+                        else:
+                            self.emit_event("stt_result", {"result": text, "final": False})
 
         except Exception as e:
-            logger.error(f"Callback error: {e}")
+            logger.error(f"Callback error: {e}", exc_info=True)
 
-    async def start_stt(self):
+    async def start_stt(self, language: str = "en-US"):
         if self.is_recording: return {"success": False, "error": "Already recording"}
         
         # Load model if needed
         if self.model is None:
-            await self.load_model()
+            if isinstance(self, type):
+                await Plugin.load_model(self)
+            else:
+                await self.load_model()
             if self.model is None:
                 return {"success": False, "error": "Model failed to load"}
 
         try:
             import sounddevice as sd
             import vosk
+            import numpy as np
             
             self.recognizer = vosk.KaldiRecognizer(self.model, 16000)
             self.play_sound()
             
-            # Define callback wrapper
+            # Get device's default sample rate
+            device_info = sd.query_devices(kind='input')
+            device_samplerate = int(device_info['default_samplerate'])
+            logger.info(f"Using device sample rate: {device_samplerate}")
+            
+            # Calculate resampling parameters
+            target_samplerate = 16000
+            resample_ratio = device_samplerate / target_samplerate
+            
+            # Define callback wrapper with linear interpolation resampling
             plugin_self = self
             def callback_wrapper(indata, frames, time_info, status):
-                if isinstance(plugin_self, type):
-                    Plugin._audio_callback(plugin_self, indata, frames, time_info, status)
-                else:
-                    plugin_self._audio_callback(indata, frames, time_info, status)
+                try:
+                    # Resample from device rate to 16kHz using linear interpolation
+                    audio_data = np.frombuffer(indata, dtype=np.int16).astype(np.float32)
+                    
+                    if resample_ratio != 1.0:
+                        # Linear interpolation resampling (much better quality than decimation)
+                        old_length = len(audio_data)
+                        new_length = int(old_length / resample_ratio)
+                        old_indices = np.arange(old_length)
+                        new_indices = np.linspace(0, old_length - 1, new_length)
+                        resampled = np.interp(new_indices, old_indices, audio_data).astype(np.int16)
+                    else:
+                        resampled = audio_data.astype(np.int16)
+                    
+                    # Call the audio callback with resampled data
+                    if isinstance(plugin_self, type):
+                        Plugin._audio_callback(plugin_self, resampled.tobytes(), len(resampled), time_info, status)
+                    else:
+                        plugin_self._audio_callback(resampled.tobytes(), len(resampled), time_info, status)
+                except Exception as e:
+                    logger.error(f"Callback wrapper error: {e}")
 
             logger.info("Starting stream...")
+            # Use smaller blocksize for faster response (2000 samples @ 16kHz = 125ms)
+            blocksize = int(2000 * resample_ratio)
             self.audio_stream = sd.RawInputStream(
-                samplerate=16000, 
-                blocksize=4000, 
+                samplerate=device_samplerate, 
+                blocksize=blocksize, 
                 dtype='int16', 
                 channels=1, 
                 callback=callback_wrapper
@@ -353,7 +378,10 @@ class Plugin:
                 res = json.loads(self.recognizer.FinalResult())
                 text = res.get("text", "")
                 if text:
-                    self.emit_event("stt_result", {"result": text, "final": True})
+                    if isinstance(self, type):
+                        Plugin.emit_event(self, "stt_result", {"result": text, "final": True})
+                    else:
+                        self.emit_event("stt_result", {"result": text, "final": True})
             
             return {"success": True}
         except Exception as e:
@@ -367,6 +395,12 @@ class Plugin:
             return {"available": True, "device": d['name'] if d else "Default", "is_recording": self.is_recording}
         except:
             return {"available": False}
+
+    async def get_pending_results(self):
+        """Get pending transcription results for polling - clears queue after read"""
+        results = list(self.transcription_queue)
+        self.transcription_queue.clear()
+        return {"results": results, "is_recording": self.is_recording}
 
     async def copy_to_clipboard(self, text: str):
         # Implementation from previous fixes (xclip/xsel/wl-copy/qdbus)

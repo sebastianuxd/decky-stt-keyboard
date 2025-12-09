@@ -1,12 +1,12 @@
 {
   "name": "decky-stt-keyboard",
-  "version": "1.1.1",
+  "version": "1.2.2",
   "description": "Speech-to-text virtual keyboard plugin for Steam Deck",
   "scripts": {
     "build": "shx rm -rf dist && rollup -c",
     "watch": "rollup -c -w",
     "prepare_dist": "pnpm run build && shx rm -rf build && shx mkdir -p 'build/STT Keyboard/dist' && shx cp dist/index.js 'build/STT Keyboard/dist/' && shx cp package.json plugin.json LICENSE README.md 'build/STT Keyboard/' && shx cp backend/src/main.py 'build/STT Keyboard/' && shx cp -r defaults 'build/STT Keyboard/' && shx cp -r backend/lib 'build/STT Keyboard/'",
-    "package": "pnpm run prepare_dist && cd build && zip -r '../decky-stt-keyboard-v1.1.1.zip' 'STT Keyboard'",
+    "package": "pnpm run prepare_dist && cd build && zip -r '../decky-stt-keyboard-v1.2.2.zip' 'STT Keyboard'",
     "deploy": "pnpm run prepare_dist && rsync -azp --delete --rsh=ssh --exclude='.git' --exclude='node_modules' 'build/STT Keyboard/' deck@${DECK_IP}:homebrew/plugins/'STT Keyboard'"
   },
   "keywords": [

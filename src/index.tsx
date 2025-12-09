@@ -20,6 +20,7 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
+  const [interimTranscript, setInterimTranscript] = useState("");
   // Track both cursor position and selection end for text replacement
   const [selectionStart, setSelectionStart] = useState<number>(0);
   const [selectionEnd, setSelectionEnd] = useState<number>(0);
@@ -36,6 +37,9 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
     // Set up callbacks
     sttService.onResult((result: SpeechRecognitionResult) => {
       if (result.isFinal) {
+        // Clear interim
+        setInterimTranscript("");
+
         // Insert new transcription at cursor position or replace selection
         setTranscript((prev) => {
           const before = prev.slice(0, selectionStart);
@@ -50,16 +54,21 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
           setSelectionEnd(newCursorPos);
           return newTranscript;
         });
+      } else {
+        // Update partial result
+        setInterimTranscript(result.transcript);
       }
     });
 
     sttService.onError((err) => {
       setError(err.message);
       setIsListening(false);
+      setInterimTranscript("");
     });
 
     sttService.onEnd(() => {
       setIsListening(false);
+      setInterimTranscript("");
     });
 
     sttService.onDownloadProgress((progress: number) => {
@@ -102,33 +111,53 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
 
   const handleCopy = async () => {
     const textToCopy = transcript.trim();
-    if (textToCopy) {
+    if (!textToCopy) return;
+
+    // Use the same approach as decky-lsfg-vk: temporary input with document.execCommand
+    const tempInput = document.createElement('input');
+    tempInput.value = textToCopy;
+    tempInput.style.position = 'absolute';
+    tempInput.style.left = '-9999px';
+    document.body.appendChild(tempInput);
+
+    try {
+      tempInput.focus();
+      tempInput.select();
+
+      let copySuccess = false;
       try {
-        // Use backend method for clipboard since browser API may not work in Decky context
-        const result = await serverAPI.callPluginMethod<{ text: string }, { success: boolean; error?: string }>(
-          "copy_to_clipboard",
-          { text: textToCopy }
-        );
-        if (result.success && result.result?.success) {
-          setCopied(true);
-          setTimeout(() => setCopied(false), 2000);
-        } else {
-          // Fallback to browser API
-          await navigator.clipboard.writeText(textToCopy);
-          setCopied(true);
-          setTimeout(() => setCopied(false), 2000);
+        // Use execCommand as primary method (works in gaming mode)
+        if (document.execCommand('copy')) {
+          copySuccess = true;
         }
-      } catch (err) {
-        console.error("Failed to copy:", err);
-        // Try browser API as fallback
-        try {
-          await navigator.clipboard.writeText(textToCopy);
-          setCopied(true);
-          setTimeout(() => setCopied(false), 2000);
-        } catch (e) {
-          setError("Failed to copy to clipboard");
-        }
+      } catch (e) {
+        console.warn("execCommand failed:", e);
       }
+
+      // If frontend method worked, we're done
+      if (copySuccess) {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+        return;
+      }
+
+      // Fallback to backend method if frontend failed
+      console.log("Frontend copy failed, trying backend...");
+      const result = await serverAPI.callPluginMethod<{ text: string }, { success: boolean; error?: string }>(
+        "copy_to_clipboard",
+        { text: textToCopy }
+      );
+      if (result.success && result.result?.success) {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+      } else {
+        setError("Copy failed - try manually selecting and copying");
+      }
+    } catch (err) {
+      console.error("Failed to copy:", err);
+      setError("Copy failed");
+    } finally {
+      document.body.removeChild(tempInput);
     }
   };
 
@@ -188,11 +217,30 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
           onKeyUp={handleSelectionChange}
           onSelect={handleSelectionChange}
           onBlur={handleBlur}
-          placeholder={isListening ? "Recording... (text appears when you stop)" : "Press Start Recording to begin, or type here"}
+          placeholder={isListening ? "Listening..." : "Press Start Recording to begin, or type here"}
           style={transcriptBoxStyle}
           disabled={isListening}
         />
       </PanelSectionRow>
+
+      {/* Interim transcript display */}
+      {(interimTranscript || isListening) && (
+        <PanelSectionRow>
+          <div style={{
+            ...transcriptBoxStyle,
+            minHeight: "30px",
+            color: "#aaa",
+            fontStyle: "italic",
+            fontSize: "0.9em",
+            marginTop: "-10px",
+            borderTop: "none",
+            borderTopLeftRadius: "0",
+            borderTopRightRadius: "0"
+          }}>
+            {interimTranscript || "..."}
+          </div>
+        </PanelSectionRow>
+      )}
 
       {/* Recording button */}
       <PanelSectionRow>
@@ -255,6 +303,8 @@ const transcriptBoxStyle: React.CSSProperties = {
   fontSize: "0.95em",
   lineHeight: "1.5",
   width: "100%",
+  color: "#fff",
+  resize: "vertical",
 };
 
 const hintStyle: React.CSSProperties = {

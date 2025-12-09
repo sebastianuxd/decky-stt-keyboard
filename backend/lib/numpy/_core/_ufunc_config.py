@@ -4,11 +4,12 @@ Functions for changing global ufunc configuration
 This provides helpers which wrap `_get_extobj_dict` and `_make_extobj`, and
 `_extobj_contextvar` from umath.
 """
+import contextlib
+import contextvars
 import functools
 
-from numpy._utils import set_module
-
-from .umath import _extobj_contextvar, _get_extobj_dict, _make_extobj
+from .._utils import set_module
+from .umath import _make_extobj, _get_extobj_dict, _extobj_contextvar
 
 __all__ = [
     "seterr", "geterr", "setbufsize", "getbufsize", "seterrcall", "geterrcall",
@@ -187,8 +188,6 @@ def setbufsize(size):
     8192
 
     """
-    if size < 0:
-        raise ValueError("buffer size must be non-negative")
     old = _get_extobj_dict()["bufsize"]
     extobj = _make_extobj(bufsize=size)
     _extobj_contextvar.set(extobj)
@@ -426,14 +425,7 @@ class errstate:
 
     """
     __slots__ = (
-        "_all",
-        "_call",
-        "_divide",
-        "_invalid",
-        "_over",
-        "_token",
-        "_under",
-    )
+        "_call", "_all", "_divide", "_over", "_under", "_invalid", "_token")
 
     def __init__(self, *, call=_Unspecified,
                  all=None, divide=None, over=None, under=None, invalid=None):

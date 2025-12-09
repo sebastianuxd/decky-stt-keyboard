@@ -35,34 +35,18 @@ export class SpeechToTextService {
 
   private setupEventListeners() {
     // Listen for STT events from backend
-    this.listeners["stt_partial"] = (data: any) => {
+    this.listeners["stt_result"] = (data: any) => {
       // Handle CustomEvent
       if (data && data.detail) data = data.detail;
 
       // Reset silence timer on any activity
       this.resetSilenceTimer();
 
-      if (this.onResultCallback && data?.text) {
+      if (this.onResultCallback && data?.result) {
         this.onResultCallback({
-          transcript: data.text,
-          confidence: 0.5,
-          isFinal: false,
-        });
-      }
-    };
-
-    this.listeners["stt_final"] = (data: any) => {
-      // Handle CustomEvent
-      if (data && data.detail) data = data.detail;
-
-      // Reset silence timer on any activity
-      this.resetSilenceTimer();
-
-      if (this.onResultCallback && data?.text) {
-        this.onResultCallback({
-          transcript: data.text,
-          confidence: 1.0,
-          isFinal: true,
+          transcript: data.result,
+          confidence: data.final ? 1.0 : 0.5,
+          isFinal: data.final,
         });
       }
     };
@@ -82,25 +66,19 @@ export class SpeechToTextService {
     };
 
     this.listeners["stt_started"] = (data: any) => {
-      // Handle CustomEvent
-      if (data && data.detail) data = data.detail;
-
-      console.log("STT started:", data);
+      console.log("STT started");
       this.isListening = true;
     };
 
     this.listeners["stt_stopped"] = (data: any) => {
-      // Handle CustomEvent
-      if (data && data.detail) data = data.detail;
-
-      console.log("STT stopped:", data);
+      console.log("STT stopped");
       this.isListening = false;
       if (this.onEndCallback) {
         this.onEndCallback();
       }
     };
 
-    this.listeners["stt_download_progress"] = (data: any) => {
+    this.listeners["download_progress"] = (data: any) => {
       // Handle CustomEvent
       if (data && data.detail) data = data.detail;
 
@@ -110,15 +88,7 @@ export class SpeechToTextService {
       }
     };
 
-    this.listeners["stt_download_complete"] = (data: any) => {
-      // Handle CustomEvent
-      if (data && data.detail) data = data.detail;
-
-      console.log("Model download complete:", data);
-    };
-
     // Register all listeners
-    // Try window.DeckyPlugin (legacy), check for other globals, or fallback to window
     const win = window as any;
     const eventBus = win.DeckyPlugin || win;
 
@@ -134,7 +104,7 @@ export class SpeechToTextService {
   }
 
   public async start(language: string = "en-US"): Promise<void> {
-    console.log("[SpeechToTextService] start() called with language:", language);
+    console.log("[SpeechToTextService] start() called");
 
     if (this.isListening) {
       console.warn("[SpeechToTextService] Speech recognition already running");
@@ -148,17 +118,12 @@ export class SpeechToTextService {
         { language }
       );
 
-      console.log("[SpeechToTextService] Backend response:", JSON.stringify(result));
-
       if (!result.success) {
         console.error("[SpeechToTextService] Backend call failed:", result);
         throw new Error((result.result as any)?.error || "Failed to start STT");
       }
 
-      // Start polling for transcription results
       this.isListening = true;
-      this.startPolling();
-      console.log("[SpeechToTextService] Recording started, polling active");
     } catch (error) {
       console.error("[SpeechToTextService] Error starting speech recognition:", error);
       if (this.onErrorCallback) {
@@ -173,8 +138,6 @@ export class SpeechToTextService {
   public async stop(): Promise<void> {
     if (!this.isListening) return;
 
-    // Stop polling first
-    this.stopPolling();
     this.isListening = false;
 
     try {
@@ -188,47 +151,7 @@ export class SpeechToTextService {
     }
   }
 
-  private startPolling(): void {
-    if (this.pollInterval !== null) {
-      return; // Already polling
-    }
-
-    console.log("[SpeechToTextService] Starting polling for transcriptions");
-
-    this.pollInterval = window.setInterval(async () => {
-      try {
-        const result = await this.serverAPI.callPluginMethod<{}, { success: boolean; results: Array<{ type: string; text: string; timestamp: number }> }>(
-          "get_transcriptions",
-          {}
-        );
-
-        if (result.success && result.result?.results && result.result.results.length > 0) {
-          for (const item of result.result.results) {
-            // Reset silence timer on any activity
-            this.resetSilenceTimer();
-
-            if (this.onResultCallback) {
-              this.onResultCallback({
-                transcript: item.text,
-                confidence: item.type === "final" ? 1.0 : 0.5,
-                isFinal: item.type === "final"
-              });
-            }
-          }
-        }
-      } catch (error) {
-        console.error("Error polling transcriptions:", error);
-      }
-    }, this.POLL_INTERVAL_MS);
-  }
-
-  private stopPolling(): void {
-    if (this.pollInterval !== null) {
-      console.log("[SpeechToTextService] Stopping polling");
-      window.clearInterval(this.pollInterval);
-      this.pollInterval = null;
-    }
-  }
+  // Polling methods removed as Vosk pushes events directly
 
   public abort(): void {
     // For backend-based STT, abort is the same as stop

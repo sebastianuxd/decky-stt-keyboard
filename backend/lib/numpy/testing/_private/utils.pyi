@@ -14,11 +14,8 @@ from typing import (
     Final,
     Generic,
     NoReturn,
-    ParamSpec,
-    Self,
     SupportsIndex,
     TypeAlias,
-    TypeVarTuple,
     overload,
     type_check_only,
 )
@@ -26,7 +23,7 @@ from typing import Literal as L
 from unittest.case import SkipTest
 
 from _typeshed import ConvertibleToFloat, GenericPath, StrOrBytesPath, StrPath
-from typing_extensions import TypeVar
+from typing_extensions import ParamSpec, Self, TypeVar, TypeVarTuple, Unpack
 
 import numpy as np
 from numpy._typing import (
@@ -170,7 +167,7 @@ else:
     def memusage() -> NoReturn: ...
 
 if sys.platform == "linux":
-    def jiffies(_proc_pid_stat: StrOrBytesPath | None = None, _load_time: list[float] | None = None) -> int: ...
+    def jiffies(_proc_pid_stat: StrOrBytesPath = ..., _load_time: list[float] = []) -> int: ...
 else:
     def jiffies(_load_time: list[float] = []) -> int: ...
 
@@ -474,22 +471,22 @@ def run_threaded(
 ) -> None: ...
 @overload
 def run_threaded(
-    func: Callable[[*_Ts], None],
+    func: Callable[[Unpack[_Ts]], None],
     max_workers: int,
     pass_count: bool,
     pass_barrier: bool,
     outer_iterations: int,
-    prepare_args: tuple[*_Ts],
+    prepare_args: tuple[Unpack[_Ts]],
 ) -> None: ...
 @overload
 def run_threaded(
-    func: Callable[[*_Ts], None],
+    func: Callable[[Unpack[_Ts]], None],
     max_workers: int = 8,
     pass_count: bool = False,
     pass_barrier: bool = False,
     outer_iterations: int = 1,
     *,
-    prepare_args: tuple[*_Ts],
+    prepare_args: tuple[Unpack[_Ts]],
 ) -> None: ...
 
 #

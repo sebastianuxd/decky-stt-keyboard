@@ -4,17 +4,14 @@ A Decky Loader plugin that adds speech-to-text functionality to your Steam Deck,
 
 ## Features
 
-- 🎤 **Speech-to-Text Integration**: Convert your speech to text using the built-in microphone
-- ⌨️ **Custom Keyboard Overlay**: Beautiful UI overlay for speech recognition
-- 🎮 **Hotkey Support**: Activate with Steam + Y (customizable)
-- 🎯 **Chord Command Support**: Quick access through chord commands
-- ⚙️ **Configurable Settings**: Auto-submit, language selection, and more
-- 🌍 **Multi-language Support**: Choose your preferred language for recognition
-- 📋 **Clipboard Integration**: Automatic text insertion or clipboard copy
+- 🎤 **Speech-to-Text Integration**: Convert your speech to text using the built-in microphone or external microphone
+- 📋 **Clipboard Integration**: Click to add to your clipboard, then paste anywhere!
+- 🎮 **Navigateable with Controllers**: Self explanitory, but as a tip you may want to use the Paste command as a rear button action.
+- ⚙️ **Accessible via QAM**: Anytime your quick access menu is available, so is STT!
 
 ## Why This Plugin?
 
-Typing on the Steam Deck with trackpads is notoriously slow and frustrating. The Steam Deck has a built-in microphone that's rarely utilized. This plugin bridges that gap, allowing you to dictate text much faster than typing - especially useful for:
+Typing on the Steam Deck with trackpads is slow and frustrating. The Steam Deck has a built-in microphone that's rarely utilized. This plugin bridges that gap, allowing you to dictate text much faster than typing - especially useful for:
 
 - Chat messages in games
 - Search queries
@@ -24,48 +21,9 @@ Typing on the Steam Deck with trackpads is notoriously slow and frustrating. The
 
 ## Installation
 
-### Prerequisites
+In Desktop Mode download the zip file, it will end up in your downloads folder, return to Gamemode and then DeckyLoader in the QAM. Click the gear icon to get to settings. Then go to Developer and enable it so you can install the custom plugin from the downloads folder.
 
-- Steam Deck with SteamOS
-- [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader) installed
-
-### Method 1: Via Decky Plugin Store (Recommended)
-
-1. Open Decky Loader on your Steam Deck
-2. Navigate to the Plugin Store
-3. Search for "STT Keyboard"
-4. Click Install
-
-### Method 2: Manual Installation
-
-1. Clone or download this repository
-2. Install dependencies and build:
-   ```bash
-   cd decky-stt-keyboard
-   pnpm install
-   pnpm run build
-   ```
-3. Copy the plugin to Decky's plugin directory:
-   ```bash
-   cp -r dist/* ~/homebrew/plugins/decky-stt-keyboard/
-   ```
-4. Restart Decky Loader or reload plugins
-
-### Method 3: Development Mode
-
-For development and testing:
-
-```bash
-# Install dependencies
-pnpm install
-
-# Start watch mode for auto-rebuild
-pnpm run watch
-
-# In another terminal, deploy to Steam Deck (requires SSH access)
-export DECK_IP=192.168.1.XXX  # Your Steam Deck's IP
-pnpm run deploy
-```
+First time usage requires that you install the voice recognition model which is 1.8GB, this may take up to 10 minutes to download, or longer depending on your internet speeds. It is important you stay on the STT plugin screen, don't navigate away from it or close your QAM until the download is complete. Doing either will unload the plugin which will stop the download. 
 
 ## Usage
 
@@ -73,49 +31,36 @@ pnpm run deploy
 
 1. Open the Decky menu (press the `...` button)
 2. Find "STT Keyboard" in the plugin list
-3. Toggle "Enable Speech-to-Text"
-4. Click "Test Speech-to-Text" or use the hotkey
-
-### Hotkey Activation
-
-- Press **Steam + Y** to activate speech-to-text
-- Speak into the microphone
-- The text will be automatically inserted into the active input field
-
-### Settings
-
-- **Enable Speech-to-Text**: Toggle the feature on/off
-- **Auto-submit**: Automatically submit text after recognition completes
-- **Language**: Select your preferred language for recognition
-
-## Browser Compatibility
-
-This plugin uses the Web Speech API, which is supported in Chromium-based browsers (including Steam's built-in browser). The API requires:
-
-- HTTPS connection (or localhost)
-- Microphone permissions granted
-- Active internet connection (for cloud-based recognition)
+3. Click the microphone icon to start or stop recording.
+4. Click into the preview text to edit, which supports starting a new recording to type into the cursor position, or replacing text you have highlited with your cursor.
+5. Click the clipboard icon to save the text for pasting as you wish.
+6. Leaving the plugin screen will reset the text field.
 
 ## Technical Details
 
 ### Architecture
 
-- **Frontend**: React + TypeScript
-- **Build System**: Rollup
-- **Speech Recognition**: Web Speech API (Chrome's implementation)
-- **Integration**: Decky Frontend Library
+- **Frontend**: React + TypeScript (Decky Frontend Library)
+- **Backend**: Python (runs in Decky Loader's Python environment)
+- **Build System**: Rollup (frontend), bundled Python dependencies
+- **Speech Recognition**: VOSK (offline speech-to-text engine)
+- **Audio Capture**: sounddevice + numpy (48kHz → 16kHz resampling)
 
 ### File Structure
 
 ```
 decky-stt-keyboard/
 ├── src/
-│   ├── components/
-│   │   └── KeyboardOverlay.tsx    # Main UI overlay
 │   ├── services/
-│   │   ├── SpeechToTextService.ts # Speech recognition logic
-│   │   └── SettingsManager.ts     # Settings persistence
-│   └── index.tsx                   # Plugin entry point
+│   │   └── SpeechToTextService.ts  # Frontend STT service (polling, callbacks)
+│   └── index.tsx                    # Plugin entry point & main UI
+├── backend/
+│   ├── src/
+│   │   └── main.py                  # Python backend (VOSK integration, audio)
+│   ├── lib/                         # Bundled Python dependencies (vosk, numpy, etc.)
+│   └── requirements.txt
+├── defaults/
+│   └── settings.json                # Default plugin settings
 ├── package.json
 ├── plugin.json
 ├── tsconfig.json
@@ -123,100 +68,42 @@ decky-stt-keyboard/
 └── README.md
 ```
 
-### Key Components
+### Key Dependencies
 
-#### SpeechToTextService
-Handles all speech recognition functionality:
-- Initializes Web Speech API
-- Manages recognition lifecycle
-- Processes results and errors
-- Supports multiple languages
-
-#### KeyboardOverlay
-Custom UI overlay for speech input:
-- Real-time transcript display
-- Interim results (live preview)
-- Recording controls
-- Error handling and display
-
-#### SettingsManager
-Persists user preferences:
-- Uses localStorage
-- Type-safe settings access
-- Automatic save on change
-
-## Development
-
-### Building
-
-```bash
-# Install dependencies
-pnpm install
-
-# Build for production
-pnpm run build
-
-# Watch mode for development
-pnpm run watch
-```
+| Dependency | Purpose |
+|------------|---------|
+| `vosk` | Offline speech recognition engine |
+| `numpy` | Audio processing & resampling |
+| `sounddevice` | Microphone input capture |
+| `decky-frontend-lib` | Decky Loader UI components |
 
 ### Testing
 
-1. Build the plugin
-2. Deploy to your Steam Deck
-3. Test in various scenarios:
+1. Install the plugin
+2. Test in various scenarios:
    - Game overlay keyboard
    - Web browser input fields
    - Chat applications
-   - Different languages
+3. Model is Enlglish only, sorry to other language speakers.
+ 
+ ### Debugging
 
-### Debugging
-
-- Check browser console for logs
-- Use Decky's developer tools
-- Monitor microphone permissions
-- Test network connectivity
+- Check Decky's dev console for logs
+- Check /home/deck/homebrew/logs/STT Keyboard
+- Delete vosk-model-en-us-0.22 folder and retry download,the Model is downloaded to /home/deck/.local/share/decky-stt-keyboard/models
 
 ## Troubleshooting
 
 ### Microphone Not Working
 
 1. Check system microphone settings
-2. Grant microphone permissions to Steam
-3. Test microphone in system settings
-4. Restart Steam
+2. Restart Steam
 
 ### Recognition Not Accurate
 
 1. Speak clearly and at a moderate pace
-2. Reduce background noise
-3. Check language settings
-4. Ensure good internet connection
-
-### Plugin Not Loading
-
-1. Verify Decky Loader is running
-2. Check plugin directory structure
-3. Review Decky logs for errors
-4. Try reinstalling the plugin
-
-### No Text Insertion
-
-1. Ensure an input field is focused
-2. Check if auto-submit is enabled
-3. Try using clipboard fallback
-4. Verify browser compatibility
-
-## Roadmap
-
-- [ ] Offline speech recognition support
-- [ ] Custom vocabulary/commands
-- [ ] Multiple language quick-switch
-- [ ] Punctuation voice commands
-- [ ] Integration with Steam's native keyboard
-- [ ] Custom hotkey configuration UI
-- [ ] Voice command macros
-- [ ] Wake word activation
+2. Keep SteamDeck within 12" of your face or use an external mic.
+3. Reduce background noise
 
 ## Contributing
 
@@ -235,19 +122,15 @@ GPL-3.0 License - see LICENSE file for details
 ## Credits
 
 - Built with [Decky Loader](https://github.com/SteamDeckHomebrew/decky-loader)
-- Uses Web Speech API
-- Inspired by the Steam Deck community's need for better input methods
+- Uses VOSK offline speech recognition
+- Inspired by the accessibility needs of the Steam Deck community
 
 ## Support
 
-- [Report Issues](https://github.com/yourusername/decky-stt-keyboard/issues)
-- [Discussions](https://github.com/yourusername/decky-stt-keyboard/discussions)
+- [Report Issues](https://github.com/sebastianuxd/decky-stt-keyboard/issues)
+- [Discussions](https://github.com/sebastianuxd/decky-stt-keyboard/discussions)
 - [Decky Loader Discord](https://deckbrew.xyz/discord)
 
 ## Acknowledgments
 
 Thanks to the Steam Deck Homebrew community and all contributors!
-
----
-
-**Note**: This plugin requires an active internet connection for speech recognition as it uses cloud-based processing. Offline support is planned for future releases.

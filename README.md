@@ -77,6 +77,9 @@ decky-stt-keyboard/
 | `sounddevice` | Microphone input capture |
 | `decky-frontend-lib` | Decky Loader UI components |
 
+**Note on Bundled Dependencies:**
+The `backend/lib` directory contains standard pre-compiled Python wheels (numpy, vosk, cffi, etc.) extracted from PyPI for Linux x86_64 (Python 3.11). These are bundled to ensure the plugin works out-of-the-box on SteamOS without requiring complex compilation or system modifications.
+
 ### Testing
 
 1. Install the plugin

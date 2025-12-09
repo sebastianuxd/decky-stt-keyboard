@@ -40,23 +40,23 @@ DATA_DIR = Path(os.environ.get("HOME", "/home/deck")) / ".local/share/decky-stt-
 BUNDLED_LIB_DIR = PLUGIN_DIR / "lib"
 MODEL_DIR = DATA_DIR / "models"
 REQUIREMENTS_FILE = PLUGIN_DIR / "requirements.txt"
-MODEL_NAME = "vosk-model-small-en-us-0.15"
-MODEL_PATH = MODEL_DIR / MODEL_NAME
-MODEL_URL = f"https://alphacephei.com/vosk/models/{MODEL_NAME}.zip"
+# Whisper model configuration
+WHISPER_MODEL_NAME = "tiny"  # Options: tiny, base, small, medium, large
+WHISPER_MODEL_PATH = MODEL_DIR / "whisper-tiny"
 
 
 class Plugin:
     """
     STT Keyboard Backend Plugin
     
-    Handles offline speech recognition using Vosk and sounddevice
+    Handles offline speech recognition using Whisper and sounddevice
     for microphone access without browser permission issues.
     """
 
     def __init__(self):
         self.settings = {}
-        self.vosk_model = None
-        self.recognizer = None
+        self.whisper_model = None
+        self.audio_buffer = []  # Buffer for audio data during recording
         self.audio_stream = None
         self.is_recording = False
         self.recording_thread = None
@@ -67,20 +67,36 @@ class Plugin:
     @staticmethod
     def play_sound():
         """Play the start listening sound"""
-        sound_path = "/usr/share/sounds/freedesktop/stereo/service-login.oga"
-        logger.info(f"Attempting to play sound: {sound_path}")
-        try:
-            # creating a subprocess to play sound shouldn't block main thread too much
-            # prefer paplay (PulseAudio) then aplay (ALSA)
-            result = subprocess.Popen(["paplay", sound_path], stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-            logger.info(f"paplay subprocess started with PID: {result.pid}")
-        except Exception as e1:
-            logger.warning(f"paplay failed: {e1}, trying aplay...")
-            try:
-                result = subprocess.Popen(["aplay", sound_path], stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-                logger.info(f"aplay subprocess started with PID: {result.pid}")
-            except Exception as e2:
-                logger.error(f"Both paplay and aplay failed: {e2}")
+        # Try multiple sound files in order of preference
+        sound_paths = [
+            "/usr/share/sounds/freedesktop/stereo/bell.oga",
+            "/usr/share/sounds/freedesktop/stereo/message.oga",
+            "/usr/share/sounds/freedesktop/stereo/service-login.oga",
+            "/usr/share/sounds/freedesktop/stereo/complete.oga",
+        ]
+        
+        for sound_path in sound_paths:
+            if os.path.exists(sound_path):
+                logger.info(f"Attempting to play sound: {sound_path}")
+                try:
+                    # Use paplay with explicit output device to ensure it goes to default sink
+                    result = subprocess.run(
+                        ["paplay", sound_path],
+                        stderr=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        timeout=3  # 3 second timeout
+                    )
+                    if result.returncode == 0:
+                        logger.info(f"Successfully played sound: {sound_path}")
+                        return
+                    else:
+                        logger.warning(f"paplay returned {result.returncode} for {sound_path}: {result.stderr.decode()}")
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"Sound playback timed out for {sound_path}")
+                except Exception as e:
+                    logger.warning(f"paplay failed for {sound_path}: {e}")
+        
+        logger.error("All sound playback attempts failed")
 
     def emit_event(self, event_name: str, data: dict):
         """Emit an event to the frontend"""
@@ -125,8 +141,8 @@ class Plugin:
         if isinstance(self, type):
             logger.info("Running in static context - initializing class attributes")
             if not hasattr(self, "settings"): self.settings = {}
-            if not hasattr(self, "vosk_model"): self.vosk_model = None
-            if not hasattr(self, "recognizer"): self.recognizer = None
+            if not hasattr(self, "whisper_model"): self.whisper_model = None
+            if not hasattr(self, "audio_buffer"): self.audio_buffer = []
             if not hasattr(self, "audio_stream"): self.audio_stream = None
             if not hasattr(self, "is_recording"): self.is_recording = False
             if not hasattr(self, "recording_thread"): self.recording_thread = None
@@ -220,10 +236,10 @@ class Plugin:
 
             # Check if dependencies are importable
             try:
-                import vosk
+                from faster_whisper import WhisperModel
                 import sounddevice
                 import numpy
-                logger.info("All dependencies successfully imported")
+                logger.info("All dependencies successfully imported (faster-whisper, sounddevice, numpy)")
                 return True
             except ImportError as e:
                 logger.error(f"Failed to import dependencies despite adding lib to path: {e}")
@@ -234,23 +250,44 @@ class Plugin:
             return False
 
     async def get_model_status(self):
-        """Check if the Vosk model is downloaded"""
-        model_exists = MODEL_PATH.exists() and (MODEL_PATH / "am").exists()
+        """Check if the Whisper model is downloaded/cached"""
+        # Whisper models are cached by huggingface_hub
+        # Check if model directory exists with model files
+        try:
+            from huggingface_hub import scan_cache_dir
+            cache_info = scan_cache_dir()
+            # Look for any whisper model in cache
+            for repo in cache_info.repos:
+                if "whisper" in repo.repo_id.lower() and WHISPER_MODEL_NAME in repo.repo_id.lower():
+                    logger.info(f"Found cached Whisper model: {repo.repo_id}")
+                    return {
+                        "downloaded": True,
+                        "path": str(repo.repo_path),
+                        "name": f"whisper-{WHISPER_MODEL_NAME}"
+                    }
+        except Exception as e:
+            logger.warning(f"Error checking huggingface cache: {e}")
+        
+        # Also check if model is loaded
+        if self.whisper_model is not None:
+            return {
+                "downloaded": True,
+                "path": "loaded",
+                "name": f"whisper-{WHISPER_MODEL_NAME}"
+            }
+        
         return {
-            "downloaded": model_exists,
-            "path": str(MODEL_PATH),
-            "name": MODEL_NAME
+            "downloaded": False,
+            "path": "",
+            "name": f"whisper-{WHISPER_MODEL_NAME}"
         }
 
     async def download_model(self):
-        """Download the Vosk speech recognition model"""
+        """Download the Whisper speech recognition model"""
         logger.info("=" * 60)
-        logger.info("download_model() called")
+        logger.info("download_model() called - Whisper model")
         logger.info("=" * 60)
         try:
-            import urllib.request
-            import zipfile
-            
             # Ensure model directory exists
             if not MODEL_DIR.exists():
                 try:
@@ -261,74 +298,49 @@ class Plugin:
                     logger.error(error_msg)
                     return {"success": False, "error": error_msg}
 
-            logger.info(f"Downloading model from {MODEL_URL}")
+            # Whisper models auto-download via huggingface_hub when first loaded
+            # So we just need to load the model here
+            logger.info(f"Downloading/loading Whisper model: {WHISPER_MODEL_NAME}")
             
-            zip_path = MODEL_DIR / f"{MODEL_NAME}.zip"
-            
-            # Download with progress - handle both instance and static context
-            plugin_instance = self
-            def download_progress(block_num, block_size, total_size):
-                downloaded = block_num * block_size
-                percent = min(100, (downloaded / total_size) * 100)
-                # Handle static context: if plugin_instance is the class, call as unbound method
-                if isinstance(plugin_instance, type):
-                    # In static context, emit_event is an unbound method, so call it on the class with explicit self
-                    Plugin.emit_event(plugin_instance, "stt_download_progress", {"percent": percent})
-                else:
-                    # Normal instance context
-                    plugin_instance.emit_event("stt_download_progress", {"percent": percent})
-            
-            urllib.request.urlretrieve(MODEL_URL, zip_path, download_progress)
-            
-            logger.info("Extracting model...")
-            # Handle static context for emit_event
-            if isinstance(self, type):
-                await Plugin.emit_event(self, "stt_download_progress", {"percent": 100, "status": "extracting"})
-            else:
-                await self.emit_event("stt_download_progress", {"percent": 100, "status": "extracting"})
-            
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(MODEL_DIR)
-            
-            # Clean up zip file
-            zip_path.unlink()
-            
-            logger.info("Model downloaded and extracted successfully")
-            # Handle static context for emit_event
-            if isinstance(self, type):
-                await Plugin.emit_event(self, "stt_download_complete", {"success": True})
-            else:
-                await self.emit_event("stt_download_complete", {"success": True})
-            return {"success": True, "path": str(MODEL_PATH)}
+            try:
+                from faster_whisper import WhisperModel
+                
+                # This will download the model if not cached
+                logger.info("Initializing WhisperModel (will download if needed)...")
+                self.whisper_model = WhisperModel(
+                    WHISPER_MODEL_NAME,
+                    device="cpu",
+                    compute_type="int8",  # Use int8 for better performance on CPU
+                    download_root=str(MODEL_DIR)
+                )
+                
+                logger.info("Whisper model loaded successfully")
+                return {"success": True, "path": str(MODEL_DIR)}
+                
+            except Exception as load_error:
+                logger.error(f"Failed to load Whisper model: {load_error}", exc_info=True)
+                return {"success": False, "error": f"Model load failed: {load_error}"}
             
         except Exception as e:
             logger.error(f"Error downloading model: {e}", exc_info=True)
-            # Handle static context for emit_event
-            if isinstance(self, type):
-                await Plugin.emit_event(self, "stt_download_complete", {"success": False, "error": str(e)})
-            else:
-                await self.emit_event("stt_download_complete", {"success": False, "error": str(e)})
             return {"success": False, "error": str(e)}
 
     async def load_model(self):
-        """Load the Vosk model into memory"""
+        """Load the Whisper model into memory"""
         try:
-            if self.vosk_model is not None:
+            if self.whisper_model is not None:
                 logger.info("Model already loaded")
                 return {"success": True}
             
-            # Check if model exists
-            if isinstance(self, type):
-                status = await Plugin.get_model_status(self)
-            else:
-                status = await self.get_model_status()
-            if not status["downloaded"]:
-                return {"success": False, "error": "Model not downloaded"}
+            from faster_whisper import WhisperModel
             
-            import vosk
-            
-            logger.info(f"Loading model from {MODEL_PATH}")
-            self.vosk_model = vosk.Model(str(MODEL_PATH))
+            logger.info(f"Loading Whisper model: {WHISPER_MODEL_NAME}")
+            self.whisper_model = WhisperModel(
+                WHISPER_MODEL_NAME,
+                device="cpu",
+                compute_type="int8",
+                download_root=str(MODEL_DIR)
+            )
             
             logger.info("Model loaded successfully")
             return {"success": True}
@@ -338,59 +350,39 @@ class Plugin:
             return {"success": False, "error": str(e)}
 
     def _audio_callback(self, indata, frames, time_info, status):
-        """Callback for audio stream - processes audio data"""
+        """Callback for audio stream - buffers audio data for Whisper"""
         try:
             if status:
                 logger.warning(f"Audio callback status: {status}")
             
-            if self.recognizer is None:
-                logger.warning("_audio_callback: recognizer is None, skipping")
-                return
+            # Ensure audio_buffer exists
+            if not hasattr(self, 'audio_buffer'):
+                self.audio_buffer = []
             
-            # Convert audio data to bytes
-            audio_data = bytes(indata)
+            # Convert to numpy array for processing
+            import numpy as np
+            audio_array = np.frombuffer(bytes(indata), dtype=np.int16).copy()
             
-            # Log audio data info periodically (every ~100 frames to avoid spam)
+            # Apply gain normalization (boost quiet audio)
+            max_val = np.max(np.abs(audio_array))
+            if max_val > 0:
+                # Normalize to 80% of max range to avoid clipping
+                target_level = 32767 * 0.8
+                gain = min(target_level / max_val, 10.0)  # Cap gain at 10x
+                if gain > 1.5:  # Only boost if audio is quiet
+                    audio_array = (audio_array * gain).astype(np.int16)
+            
+            # Buffer the audio data
+            self.audio_buffer.append(audio_array)
+            
+            # Log periodically
             if not hasattr(self, '_callback_count'):
                 self._callback_count = 0
             self._callback_count += 1
             
             if self._callback_count == 1 or self._callback_count % 100 == 0:
-                # Calculate audio level (RMS)
-                import numpy as np
-                audio_array = np.frombuffer(audio_data, dtype=np.int16)
                 rms = np.sqrt(np.mean(audio_array.astype(float)**2))
-                max_val = np.max(np.abs(audio_array))
-                logger.info(f"_audio_callback #{self._callback_count}: frames={frames}, data_len={len(audio_data)}, RMS={rms:.1f}, max={max_val}")
-            
-            # Ensure transcription_queue exists (for static context)
-            if not hasattr(self, 'transcription_queue'):
-                self.transcription_queue = deque(maxlen=100)
-            
-            # Process with Vosk
-            if self.recognizer.AcceptWaveform(audio_data):
-                # Final result
-                result = json.loads(self.recognizer.Result())
-                logger.info(f"Vosk final result: {result}")
-                if result.get("text"):
-                    logger.info(f"Vosk Recognized: '{result['text']}'")
-                    # Add to queue for polling instead of emitting
-                    self.transcription_queue.append({
-                        "type": "final",
-                        "text": result["text"],
-                        "timestamp": time.time()
-                    })
-            else:
-                # Partial result
-                partial = json.loads(self.recognizer.PartialResult())
-                if partial.get("partial"):
-                    logger.info(f"Vosk partial: '{partial['partial']}'")
-                    # Add partial to queue for polling
-                    self.transcription_queue.append({
-                        "type": "partial",
-                        "text": partial["partial"],
-                        "timestamp": time.time()
-                    })
+                logger.info(f"Audio callback #{self._callback_count}: frames={frames}, RMS={rms:.1f}")
                     
         except Exception as e:
             logger.error(f"Error in audio callback: {e}", exc_info=True)
@@ -407,7 +399,7 @@ class Plugin:
                 return {"success": False, "error": "Already recording"}
             
             # Ensure model is loaded
-            if self.vosk_model is None:
+            if self.whisper_model is None:
                 if isinstance(self, type):
                     load_result = await Plugin.load_model(self)
                 else:
@@ -415,57 +407,46 @@ class Plugin:
                 if not load_result["success"]:
                     return load_result
             
-            import vosk
             import sounddevice as sd
+            import numpy as np
             
-            # Create recognizer
-            self.recognizer = vosk.KaldiRecognizer(self.vosk_model, 16000)
+            # Clear audio buffer
+            self.audio_buffer = []
+            self._callback_count = 0
             
             # Start audio stream
-            logger.info("Starting audio recording...")
+            logger.info("Starting audio recording for Whisper...")
             
-            # Query default input device to get supported sample rate
+            # Query default input device
             try:
-                # query_devices(kind='input') returns the default input device info
                 device_info = sd.query_devices(kind='input')
                 if device_info:
-                    native_rate = int(device_info['default_samplerate'])
-                    logger.info(f"Detected Default Input Device: {device_info['name']}, Rate: {native_rate}")
+                    self.sample_rate = int(device_info['default_samplerate'])
+                    logger.info(f"Detected Input Device: {device_info['name']}, Rate: {self.sample_rate}")
                 else:
-                    native_rate = 44100 # Fallback
-                    logger.warning("Could not detect input device, using fallback rate 44100")
+                    self.sample_rate = 16000
+                    logger.warning("Could not detect input device, using 16000 Hz")
             except Exception as e:
                 logger.error(f"Error querying devices: {e}")
-                native_rate = 44100 # Fallback
-                
-            # Create recognizer with NATIVE rate
-            # Vosk supports different sample rates if initialized with it
-            logger.info(f"Initializing Vosk with sample rate: {native_rate}")
-            self.recognizer = vosk.KaldiRecognizer(self.vosk_model, native_rate)
+                self.sample_rate = 16000
 
             # Play start sound
             self.play_sound()
 
-            # Create a bound callback that works in both instance and static context
-            # In static context, self is the class, and self._audio_callback is unbound
-            # We need to create a wrapper that properly passes self
+            # Create callback wrapper
             plugin_self = self
             def audio_callback_wrapper(indata, frames, time_info, status):
-                # Call the actual method with self explicitly bound
                 if isinstance(plugin_self, type):
-                    # Static context: call as unbound method
                     Plugin._audio_callback(plugin_self, indata, frames, time_info, status)
                 else:
-                    # Instance context: call normally
                     plugin_self._audio_callback(indata, frames, time_info, status)
             
-            logger.info("Creating audio stream with callback wrapper...")
+            logger.info("Creating audio stream...")
 
-            # Open stream using default device to avoid locking hardware exclusively
-            # We explicitly do NOT specify device_index to let sd use the system default (PulseAudio/PipeWire)
+            # Open audio stream - Whisper works best with 16kHz but we'll resample if needed
             self.audio_stream = sd.RawInputStream(
-                samplerate=native_rate,
-                blocksize=8000,
+                samplerate=self.sample_rate,
+                blocksize=4000,
                 dtype='int16',
                 channels=1,
                 callback=audio_callback_wrapper
@@ -474,27 +455,18 @@ class Plugin:
             self.audio_stream.start()
             self.is_recording = True
             
-            if isinstance(self, type):
-                Plugin.emit_event(self, "stt_started", {"success": True})
-            else:
-                self.emit_event("stt_started", {"success": True})
-            logger.info("STT recording started")
+            logger.info("STT recording started - speak now, transcription happens when you stop")
             
             return {"success": True}
             
         except Exception as e:
             logger.error(f"Error starting STT: {e}", exc_info=True)
-            if isinstance(self, type):
-                Plugin.emit_event(self, "stt_error", {"error": str(e)})
-            else:
-                self.emit_event("stt_error", {"error": str(e)})
             return {"success": False, "error": str(e)}
 
     async def stop_stt(self):
-        """Stop speech-to-text recording"""
+        """Stop speech-to-text recording and transcribe with Whisper"""
         logger.info(f"stop_stt called. self type: {type(self)}")
         try:
-            # Handle static context where self might be the class but attributes are on the class
             if isinstance(self, type):
                 is_recording = getattr(self, "is_recording", False)
             else:
@@ -506,21 +478,76 @@ class Plugin:
             
             logger.info("Stopping STT recording...")
             
+            # Stop audio stream
             if self.audio_stream:
                 self.audio_stream.stop()
                 self.audio_stream.close()
                 self.audio_stream = None
             
-            self.recognizer = None
             self.is_recording = False
             
-            if isinstance(self, type):
-                Plugin.emit_event(self, "stt_stopped", {"success": True})
-            else:
-                self.emit_event("stt_stopped", {"success": True})
-            logger.info("STT recording stopped")
+            # Get buffered audio
+            if not hasattr(self, 'audio_buffer') or not self.audio_buffer:
+                logger.warning("No audio data captured")
+                return {"success": True, "text": ""}
             
-            return {"success": True}
+            import numpy as np
+            
+            # Combine all audio chunks
+            audio_data = np.concatenate(self.audio_buffer)
+            logger.info(f"Total audio samples: {len(audio_data)}, duration: {len(audio_data)/self.sample_rate:.1f}s")
+            
+            # Clear buffer
+            self.audio_buffer = []
+            
+            # Convert to float32 normalized to [-1, 1] for Whisper
+            audio_float = audio_data.astype(np.float32) / 32768.0
+            
+            # Resample to 16kHz if needed (Whisper expects 16kHz)
+            if self.sample_rate != 16000:
+                try:
+                    from scipy import signal
+                    num_samples = int(len(audio_float) * 16000 / self.sample_rate)
+                    audio_float = signal.resample(audio_float, num_samples)
+                    logger.info(f"Resampled from {self.sample_rate}Hz to 16000Hz")
+                except ImportError:
+                    logger.warning("scipy not available, using basic resampling")
+                    # Basic resampling fallback
+                    ratio = 16000 / self.sample_rate
+                    indices = np.arange(0, len(audio_float), 1/ratio).astype(int)
+                    indices = indices[indices < len(audio_float)]
+                    audio_float = audio_float[indices]
+            
+            # Transcribe with Whisper
+            logger.info("Transcribing with Whisper...")
+            try:
+                segments, info = self.whisper_model.transcribe(
+                    audio_float,
+                    language="en",
+                    beam_size=5,
+                    vad_filter=True,  # Filter out silence
+                )
+                
+                # Combine all segments
+                text = " ".join([seg.text.strip() for seg in segments])
+                logger.info(f"Whisper transcription: '{text}'")
+                
+                # Queue the result
+                if not hasattr(self, 'transcription_queue'):
+                    self.transcription_queue = deque(maxlen=100)
+                
+                if text:
+                    self.transcription_queue.append({
+                        "type": "final",
+                        "text": text,
+                        "timestamp": time.time()
+                    })
+                
+                return {"success": True, "text": text}
+                
+            except Exception as whisper_error:
+                logger.error(f"Whisper transcription failed: {whisper_error}", exc_info=True)
+                return {"success": False, "error": f"Transcription failed: {whisper_error}"}
             
         except Exception as e:
             logger.error(f"Error stopping STT: {e}", exc_info=True)
@@ -573,6 +600,65 @@ class Plugin:
         except Exception as e:
             logger.error(f"Error checking microphone: {e}")
             return {"available": False, "error": str(e)}
+
+    async def copy_to_clipboard(self, text: str):
+        """Copy text to system clipboard using xclip/xsel"""
+        logger.info(f"Copying text to clipboard: {text[:50]}..." if len(text) > 50 else f"Copying text to clipboard: {text}")
+        try:
+            # Try xclip first (most common on Linux)
+            try:
+                process = subprocess.Popen(
+                    ["xclip", "-selection", "clipboard"],
+                    stdin=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                process.communicate(input=text.encode('utf-8'), timeout=5)
+                if process.returncode == 0:
+                    logger.info("Successfully copied to clipboard using xclip")
+                    return {"success": True}
+            except FileNotFoundError:
+                pass  # xclip not installed
+            except Exception as e:
+                logger.warning(f"xclip failed: {e}")
+            
+            # Try xsel as fallback
+            try:
+                process = subprocess.Popen(
+                    ["xsel", "--clipboard", "--input"],
+                    stdin=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                process.communicate(input=text.encode('utf-8'), timeout=5)
+                if process.returncode == 0:
+                    logger.info("Successfully copied to clipboard using xsel")
+                    return {"success": True}
+            except FileNotFoundError:
+                pass  # xsel not installed
+            except Exception as e:
+                logger.warning(f"xsel failed: {e}")
+            
+            # Try wl-copy for Wayland
+            try:
+                process = subprocess.Popen(
+                    ["wl-copy"],
+                    stdin=subprocess.PIPE,
+                    stderr=subprocess.PIPE
+                )
+                process.communicate(input=text.encode('utf-8'), timeout=5)
+                if process.returncode == 0:
+                    logger.info("Successfully copied to clipboard using wl-copy")
+                    return {"success": True}
+            except FileNotFoundError:
+                pass  # wl-copy not installed
+            except Exception as e:
+                logger.warning(f"wl-copy failed: {e}")
+            
+            logger.error("No clipboard tool available (tried xclip, xsel, wl-copy)")
+            return {"success": False, "error": "No clipboard tool available"}
+            
+        except Exception as e:
+            logger.error(f"Error copying to clipboard: {e}", exc_info=True)
+            return {"success": False, "error": str(e)}
 
     # Asyncio-compatible long-running code, executed in a task when the plugin is loaded
     async def _migration(self):

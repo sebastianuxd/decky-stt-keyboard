@@ -5,14 +5,14 @@ import {
   ServerAPI,
   staticClasses,
   ButtonItem,
+  TextField,
 } from "decky-frontend-lib";
-import React, { VFC, useState, useEffect } from "react";
-import { FaMicrophone, FaCopy, FaCheck, FaTrash } from "react-icons/fa";
+import React, { VFC, useState, useEffect, useRef } from "react";
+import { FaMicrophone } from "react-icons/fa";
 import { SpeechToTextService, SpeechRecognitionResult, ModelStatus } from "./services/SpeechToTextService";
 
 const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
   const [transcript, setTranscript] = useState("");
-  const [interimTranscript, setInterimTranscript] = useState("");
   const [isListening, setIsListening] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -20,6 +20,10 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
+  // Track both cursor position and selection end for text replacement
+  const [selectionStart, setSelectionStart] = useState<number>(0);
+  const [selectionEnd, setSelectionEnd] = useState<number>(0);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     // Check model status on mount
@@ -32,10 +36,20 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
     // Set up callbacks
     sttService.onResult((result: SpeechRecognitionResult) => {
       if (result.isFinal) {
-        setTranscript((prev) => (prev ? prev + " " : "") + result.transcript);
-        setInterimTranscript("");
-      } else {
-        setInterimTranscript(result.transcript);
+        // Insert new transcription at cursor position or replace selection
+        setTranscript((prev) => {
+          const before = prev.slice(0, selectionStart);
+          const after = prev.slice(selectionEnd); // Use selectionEnd to replace selected text
+          const newText = result.transcript.trim();
+          const spaceBefore = before.length > 0 && !before.endsWith(" ") ? " " : "";
+          const spaceAfter = after.length > 0 && !after.startsWith(" ") ? " " : "";
+          const newTranscript = before + spaceBefore + newText + spaceAfter + after;
+          // Update cursor position to after the inserted text
+          const newCursorPos = before.length + spaceBefore.length + newText.length;
+          setSelectionStart(newCursorPos);
+          setSelectionEnd(newCursorPos);
+          return newTranscript;
+        });
       }
     });
 
@@ -55,7 +69,7 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
     return () => {
       sttService.cleanup();
     };
-  }, [sttService]);
+  }, [sttService, selectionStart, selectionEnd]);
 
   const handleDownloadModel = async () => {
     setIsDownloading(true);
@@ -86,44 +100,74 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
     }
   };
 
-  const handleCopy = () => {
+  const handleCopy = async () => {
     const textToCopy = transcript.trim();
     if (textToCopy) {
-      navigator.clipboard.writeText(textToCopy).then(() => {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 2000);
-      }).catch((err) => {
+      try {
+        // Use backend method for clipboard since browser API may not work in Decky context
+        const result = await serverAPI.callPluginMethod<{ text: string }, { success: boolean; error?: string }>(
+          "copy_to_clipboard",
+          { text: textToCopy }
+        );
+        if (result.success && result.result?.success) {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 2000);
+        } else {
+          // Fallback to browser API
+          await navigator.clipboard.writeText(textToCopy);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 2000);
+        }
+      } catch (err) {
         console.error("Failed to copy:", err);
-        setError("Failed to copy to clipboard");
-      });
+        // Try browser API as fallback
+        try {
+          await navigator.clipboard.writeText(textToCopy);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 2000);
+        } catch (e) {
+          setError("Failed to copy to clipboard");
+        }
+      }
     }
   };
 
   const handleClear = () => {
     setTranscript("");
-    setInterimTranscript("");
+    setSelectionStart(0);
+    setSelectionEnd(0);
   };
 
-  const fullText = transcript + (interimTranscript ? " " + interimTranscript : "");
+  // Handle text changes from the editable textarea
+  const handleTextChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setTranscript(e.target.value);
+  };
+
+  // Track cursor/selection position when user interacts with textarea
+  const handleSelectionChange = (e: React.SyntheticEvent<HTMLTextAreaElement>) => {
+    const target = e.target as HTMLTextAreaElement;
+    setSelectionStart(target.selectionStart || 0);
+    setSelectionEnd(target.selectionEnd || 0);
+  };
+
+  // Save selection when textarea loses focus (so clicking button doesn't lose it)
+  const handleBlur = (e: React.FocusEvent<HTMLTextAreaElement>) => {
+    setSelectionStart(e.target.selectionStart || 0);
+    setSelectionEnd(e.target.selectionEnd || 0);
+  };
 
   return (
     <PanelSection>
       {/* Model download prompt */}
       {!modelStatus?.downloaded && (
         <PanelSectionRow>
-          <div style={downloadPromptStyle}>
-            <p style={{ margin: "0 0 8px 0", fontWeight: "bold" }}>Speech Model Required</p>
-            <p style={{ margin: "0 0 12px 0", fontSize: "0.85em", opacity: 0.8 }}>
-              Download the offline model (~40MB) to enable speech recognition.
-            </p>
-            <button
-              onClick={handleDownloadModel}
-              style={downloadButtonStyle}
-              disabled={isDownloading}
-            >
-              {isDownloading ? `Downloading... ${downloadProgress.toFixed(0)}%` : "Download Model"}
-            </button>
-          </div>
+          <ButtonItem
+            layout="below"
+            label={isDownloading ? `Downloading... ${downloadProgress.toFixed(0)}%` : "Download Speech Model"}
+            onClick={handleDownloadModel}
+            disabled={isDownloading}
+            description="Download the offline model (~40MB) to enable speech recognition."
+          />
         </PanelSectionRow>
       )}
 
@@ -134,69 +178,56 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
         </PanelSectionRow>
       )}
 
-      {/* Transcript preview */}
+      {/* Editable transcript area */}
       <PanelSectionRow>
-        <div style={transcriptBoxStyle}>
-          {fullText ? (
-            <>
-              <span style={{ color: "#fff" }}>{transcript}</span>
-              {interimTranscript && (
-                <span style={{ color: "#888", fontStyle: "italic" }}> {interimTranscript}</span>
-              )}
-            </>
-          ) : (
-            <span style={{ color: "#666" }}>
-              {isListening ? "Listening..." : "Tap the microphone to start speaking"}
-            </span>
-          )}
-        </div>
+        <textarea
+          ref={textareaRef}
+          value={transcript}
+          onChange={handleTextChange}
+          onClick={handleSelectionChange}
+          onKeyUp={handleSelectionChange}
+          onSelect={handleSelectionChange}
+          onBlur={handleBlur}
+          placeholder={isListening ? "Recording... (text appears when you stop)" : "Press Start Recording to begin, or type here"}
+          style={transcriptBoxStyle}
+          disabled={isListening}
+        />
       </PanelSectionRow>
 
-      {/* Control buttons */}
+      {/* Recording button */}
       <PanelSectionRow>
-        <div style={controlsContainerStyle}>
-          {/* Mic button */}
-          <button
-            onClick={handleToggleRecording}
-            style={{
-              ...micButtonStyle,
-              backgroundColor: isListening ? "#e74c3c" : "#2ecc71",
-            }}
-            disabled={!modelStatus?.downloaded || isDownloading}
-          >
-            <FaMicrophone size={28} />
-          </button>
+        <ButtonItem
+          layout="below"
+          label={isListening ? "🔴 Stop Recording" : "🎤 Start Recording"}
+          onClick={handleToggleRecording}
+          disabled={!modelStatus?.downloaded || isDownloading}
+        />
+      </PanelSectionRow>
 
-          {/* Copy button */}
-          <button
-            onClick={handleCopy}
-            style={{
-              ...actionButtonStyle,
-              opacity: transcript ? 1 : 0.5,
-            }}
-            disabled={!transcript}
-          >
-            {copied ? <FaCheck size={20} /> : <FaCopy size={20} />}
-          </button>
+      {/* Copy button */}
+      <PanelSectionRow>
+        <ButtonItem
+          layout="below"
+          label={copied ? "✓ Copied!" : "📋 Copy to Clipboard"}
+          onClick={handleCopy}
+          disabled={!transcript}
+        />
+      </PanelSectionRow>
 
-          {/* Clear button */}
-          <button
-            onClick={handleClear}
-            style={{
-              ...actionButtonStyle,
-              opacity: transcript || interimTranscript ? 1 : 0.5,
-            }}
-            disabled={!transcript && !interimTranscript}
-          >
-            <FaTrash size={18} />
-          </button>
-        </div>
+      {/* Clear button */}
+      <PanelSectionRow>
+        <ButtonItem
+          layout="below"
+          label="🗑️ Clear Text"
+          onClick={handleClear}
+          disabled={!transcript}
+        />
       </PanelSectionRow>
 
       {/* Status hint */}
       <PanelSectionRow>
         <div style={hintStyle}>
-          {isListening ? "🔴 Recording... tap mic to stop" : "🎤 Tap mic to start"}
+          {isListening ? "🔴 Recording in progress..." : "🎤 Ready to record"}
         </div>
       </PanelSectionRow>
     </PanelSection>
@@ -204,26 +235,6 @@ const Content: VFC<{ serverAPI: ServerAPI }> = ({ serverAPI }) => {
 };
 
 // Styles
-const downloadPromptStyle: React.CSSProperties = {
-  backgroundColor: "#f39c12",
-  color: "#fff",
-  padding: "12px",
-  borderRadius: "8px",
-  textAlign: "center",
-  width: "100%",
-};
-
-const downloadButtonStyle: React.CSSProperties = {
-  backgroundColor: "#fff",
-  color: "#f39c12",
-  border: "none",
-  padding: "8px 20px",
-  borderRadius: "6px",
-  fontSize: "0.95em",
-  fontWeight: "bold",
-  cursor: "pointer",
-};
-
 const errorStyle: React.CSSProperties = {
   backgroundColor: "#e74c3c",
   color: "#fff",
@@ -244,43 +255,6 @@ const transcriptBoxStyle: React.CSSProperties = {
   fontSize: "0.95em",
   lineHeight: "1.5",
   width: "100%",
-};
-
-const controlsContainerStyle: React.CSSProperties = {
-  display: "flex",
-  justifyContent: "center",
-  alignItems: "center",
-  gap: "16px",
-  width: "100%",
-  padding: "8px 0",
-};
-
-const micButtonStyle: React.CSSProperties = {
-  width: "64px",
-  height: "64px",
-  borderRadius: "50%",
-  border: "none",
-  color: "#fff",
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  cursor: "pointer",
-  boxShadow: "0 4px 12px rgba(0, 0, 0, 0.3)",
-  transition: "all 0.2s ease",
-};
-
-const actionButtonStyle: React.CSSProperties = {
-  width: "48px",
-  height: "48px",
-  borderRadius: "50%",
-  border: "none",
-  backgroundColor: "#555",
-  color: "#fff",
-  display: "flex",
-  alignItems: "center",
-  justifyContent: "center",
-  cursor: "pointer",
-  transition: "all 0.2s ease",
 };
 
 const hintStyle: React.CSSProperties = {
